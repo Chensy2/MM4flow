@@ -1,4 +1,3 @@
-from zat.log_to_dataframe import LogToDataFrame
 from datasets import Dataset
 from transformers import BertTokenizerFast
 from transformers import BertConfig, BertForMaskedLM
@@ -94,7 +93,7 @@ conn_features = ['duration', 'orig_pkts', 'resp_pkts', 'orig_bytes', 'resp_bytes
 ps_features = ['up', 'down', 'ps']
 raw_features = ['fwd_raw', 'bwd_raw']
 
-log2df = LogToDataFrame()
+log2df = None
 
 max_length_ps = 256
 max_length_bytes = 512
@@ -188,6 +187,11 @@ def load_eval_csv(eval_csv):
 
 
 def load_logs(rootdir, modality):
+    global log2df
+    if log2df is None:
+        from zat.log_to_dataframe import LogToDataFrame
+        log2df = LogToDataFrame()
+
     df_test = pd.DataFrame()
     for filename in tqdm(os.listdir(rootdir), desc='reading pcap_log'):
         log_path = os.path.join(rootdir, filename)
