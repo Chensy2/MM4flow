@@ -4,6 +4,7 @@ from transformers import BertTokenizerFast
 from transformers import BertConfig, BertForMaskedLM
 from safetensors.torch import load_model
 from torch import nn
+from sklearn.metrics import accuracy_score, confusion_matrix, classification_report
 from tqdm import tqdm
 import pandas as pd
 import numpy as np
@@ -180,6 +181,12 @@ def make_dataset(df, modality):
     return dataset
 
 
+def load_eval_csv(eval_csv):
+    if not os.path.exists(eval_csv):
+        raise FileNotFoundError(f"Missing eval csv: {eval_csv}")
+    return pd.read_csv(eval_csv, compression='gzip', index_col=0)
+
+
 def load_logs(rootdir, modality):
     df_test = pd.DataFrame()
     for filename in tqdm(os.listdir(rootdir), desc='reading pcap_log'):
@@ -267,12 +274,14 @@ if __name__ == '__main__':
     parser.add_argument('--model_ts', '-m', type=str, default='202412110000')
     parser.add_argument('--batch_size', '-b', type=int, default=64)
     parser.add_argument('--output', '-o', type=str, default='result.csv')
+    parser.add_argument('--eval_csv', type=str, default=None)
 
     args = parser.parse_args()
     rootdir = args.dataset
     model_ts = args.model_ts
     batch_size = args.batch_size
     output = args.output
+    eval_csv = args.eval_csv
 
     model_path = os.path.join('model-classifier', model_ts)
     with open(os.path.join(model_path, model_name, "info.json")) as f:
@@ -283,7 +292,10 @@ if __name__ == '__main__':
     num_classes = len(label2idx)
     idx2label = dict(zip(label2idx.values(), label2idx.keys()))
 
-    df_test = load_logs(rootdir, modality)
+    if eval_csv is not None:
+        df_test = load_eval_csv(eval_csv)
+    else:
+        df_test = load_logs(rootdir, modality)
     df_test = preprocess_dataframe(df_test, modality)
     testset = make_dataset(df_test, modality)
 
@@ -307,6 +319,31 @@ if __name__ == '__main__':
     df_test['pred'] = y_pred
     df_test['pred'] = df_test['pred'].map(idx2label)
     print(df_test['pred'].value_counts())
+
+    if 'label' in df_test.columns:
+        y_true = df_test['label'].map(label2idx)
+        known_label_mask = y_true.notna()
+        if not known_label_mask.all():
+            unknown_labels = sorted(df_test.loc[~known_label_mask, 'label'].dropna().unique())
+            print(f"Skip {int((~known_label_mask).sum())} rows with labels not seen during training: {unknown_labels}")
+
+        y_true_eval = y_true[known_label_mask].astype(int)
+        y_pred_eval = y_pred[known_label_mask.to_numpy()]
+        labels_eval = [label for label, _ in sorted(label2idx.items(), key=lambda item: item[1])]
+
+        print("accuracy:", accuracy_score(y_true=y_true_eval, y_pred=y_pred_eval))
+        print(confusion_matrix(
+            y_true=y_true_eval,
+            y_pred=y_pred_eval,
+            labels=[label2idx[label] for label in labels_eval]
+        ))
+        print(classification_report(
+            y_true=y_true_eval,
+            y_pred=y_pred_eval,
+            digits=4,
+            target_names=labels_eval,
+            labels=[label2idx[label] for label in labels_eval]
+        ))
 
     df_test[info_features + conn_features + ['pred']].to_csv(output)
 
