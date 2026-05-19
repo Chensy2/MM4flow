@@ -252,20 +252,11 @@ def load_configs(modality, info):
 
 def build_model(modality, ps_config, bytes_config, num_classes, info):
     if modality == 'ps':
-        model = UniModalClassifier(ps_config, num_classes=num_classes, modality='ps').to(device)
-        model.weight_init(os.path.join('model', f'{premodel_name_ps}_{info["pre_timestamp_ps"]}'))
-        return model
+        return UniModalClassifier(ps_config, num_classes=num_classes, modality='ps').to(device)
     if modality == 'byte':
-        model = UniModalClassifier(bytes_config, num_classes=num_classes, modality='byte').to(device)
-        model.weight_init(os.path.join('model', f'{premodel_name_raw}_{info["pre_timestamp_raw"]}'))
-        return model
+        return UniModalClassifier(bytes_config, num_classes=num_classes, modality='byte').to(device)
 
-    model = Classifier(ps_config=ps_config, bytes_config=bytes_config, num_classes=num_classes).to(device)
-    model.weight_init(
-        premodel_ps_path=os.path.join('model', f'{premodel_name_ps}_{info["pre_timestamp_ps"]}'),
-        premodel_bytes_path=os.path.join('model', f'{premodel_name_raw}_{info["pre_timestamp_raw"]}')
-    )
-    return model
+    return Classifier(ps_config=ps_config, bytes_config=bytes_config, num_classes=num_classes).to(device)
 
 
 if __name__ == '__main__':

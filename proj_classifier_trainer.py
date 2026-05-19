@@ -144,8 +144,48 @@ premodel_name_ps = 'BERT-ps'
 premodel_name_raw = 'BERT-bytes'
 pre_timestamp_ps = '202406132201'
 pre_timestamp_raw = '202407081419'
+pre_checkpoint_ps = None
+pre_checkpoint_raw = None
 
 model_name = "MM4flow"
+
+
+def checkpoint_sort_key(path):
+    name = os.path.basename(path)
+    try:
+        return int(name.split('-')[-1])
+    except ValueError:
+        return -1
+
+
+def resolve_premodel_path(model_name, timestamp, checkpoint=None):
+    model_path = os.path.join('model', f'{model_name}_{timestamp}')
+    if checkpoint is not None:
+        checkpoint_path = os.path.join(model_path, checkpoint)
+        if not os.path.exists(os.path.join(checkpoint_path, 'model.safetensors')):
+            raise FileNotFoundError(f"Missing {os.path.join(checkpoint_path, 'model.safetensors')}")
+        return checkpoint_path
+
+    if os.path.exists(os.path.join(model_path, 'model.safetensors')):
+        return model_path
+
+    checkpoint_dirs = [
+        os.path.join(model_path, name)
+        for name in os.listdir(model_path)
+        if name.startswith('checkpoint-') and os.path.isdir(os.path.join(model_path, name))
+    ]
+    checkpoint_dirs = [
+        path for path in checkpoint_dirs
+        if os.path.exists(os.path.join(path, 'model.safetensors'))
+    ]
+    if not checkpoint_dirs:
+        raise FileNotFoundError(
+            f"Missing model.safetensors in {model_path} or {model_path}/checkpoint-*"
+        )
+
+    checkpoint_path = sorted(checkpoint_dirs, key=checkpoint_sort_key)[-1]
+    print(f"Using latest checkpoint for {model_name}: {checkpoint_path}")
+    return checkpoint_path
 
 
 def preprocess_dataframe(df, modality, label2idx=None):
@@ -245,17 +285,17 @@ def load_configs(modality):
 def build_model(modality, ps_config, bytes_config, num_classes):
     if modality == 'ps':
         model = UniModalClassifier(ps_config, num_classes=num_classes, modality='ps').to(device)
-        model.weight_init(os.path.join('model', f'{premodel_name_ps}_{pre_timestamp_ps}'))
+        model.weight_init(resolve_premodel_path(premodel_name_ps, pre_timestamp_ps, pre_checkpoint_ps))
         return model
     if modality == 'byte':
         model = UniModalClassifier(bytes_config, num_classes=num_classes, modality='byte').to(device)
-        model.weight_init(os.path.join('model', f'{premodel_name_raw}_{pre_timestamp_raw}'))
+        model.weight_init(resolve_premodel_path(premodel_name_raw, pre_timestamp_raw, pre_checkpoint_raw))
         return model
 
     model = Classifier(ps_config=ps_config, bytes_config=bytes_config, num_classes=num_classes).to(device)
     model.weight_init(
-        premodel_ps_path=os.path.join('model', f'{premodel_name_ps}_{pre_timestamp_ps}'),
-        premodel_bytes_path=os.path.join('model', f'{premodel_name_raw}_{pre_timestamp_raw}')
+        premodel_ps_path=resolve_premodel_path(premodel_name_ps, pre_timestamp_ps, pre_checkpoint_ps),
+        premodel_bytes_path=resolve_premodel_path(premodel_name_raw, pre_timestamp_raw, pre_checkpoint_raw)
     )
     return model
 
@@ -285,6 +325,10 @@ if __name__ == '__main__':
     parser.add_argument('--modality', '-M', choices=['mm', 'ps', 'byte'], default='mm')
     parser.add_argument('--eval_per_epoch', '-ev', type=int, default=1)
     parser.add_argument('--save_per_epoch', '-sv', type=int, default=1)
+    parser.add_argument('--pre_timestamp_ps', type=str, default=pre_timestamp_ps)
+    parser.add_argument('--pre_timestamp_raw', type=str, default=pre_timestamp_raw)
+    parser.add_argument('--pre_checkpoint_ps', type=str, default=None)
+    parser.add_argument('--pre_checkpoint_raw', type=str, default=None)
 
     args = parser.parse_args()
     timestamp = args.timestamp
@@ -294,6 +338,10 @@ if __name__ == '__main__':
     learning_rate = args.learning_rate
     output = args.output
     modality = args.modality
+    pre_timestamp_ps = args.pre_timestamp_ps
+    pre_timestamp_raw = args.pre_timestamp_raw
+    pre_checkpoint_ps = args.pre_checkpoint_ps
+    pre_checkpoint_raw = args.pre_checkpoint_raw
 
     model_root = os.path.join('model-classifier', output) if output is not None else 'model-classifier'
     if not os.path.exists(model_root):
@@ -326,8 +374,10 @@ if __name__ == '__main__':
         'model_type': model_type,
         'premodel_name_ps': premodel_name_ps,
         'pre_timestamp_ps': pre_timestamp_ps,
+        'pre_checkpoint_ps': pre_checkpoint_ps,
         'premodel_name_raw': premodel_name_raw,
         'pre_timestamp_raw': pre_timestamp_raw,
+        'pre_checkpoint_raw': pre_checkpoint_raw,
         'num_classes': num_classes,
         'label2idx': label2idx
     }
