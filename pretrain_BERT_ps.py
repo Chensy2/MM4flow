@@ -37,7 +37,9 @@ if __name__ == '__main__':
     parser.add_argument('--eval_per_epoch', '-ev', type=int, default=10)
     parser.add_argument('--save_per_epoch', '-sv', type=int, default=5)
     parser.add_argument('--n_epochs', '-ep', type=int, default=1)
-    parser.add_argument('--learning_rate', '-lr', type=int, default=5e-5)
+    parser.add_argument('--learning_rate', '-lr', type=float, default=5e-5)
+    parser.add_argument('--max_steps', '-ms', type=int, default=-1)
+    parser.add_argument('--max_eval_samples', type=int, default=10000)
 
     args = parser.parse_args()
 
@@ -53,6 +55,8 @@ if __name__ == '__main__':
     save_per_epoch = args.save_per_epoch
     n_epochs = args.n_epochs
     learning_rate = args.learning_rate
+    user_max_steps = args.max_steps
+    max_eval_samples = args.max_eval_samples
 
     if torch.cuda.is_available():
         gpu_count = torch.cuda.device_count()
@@ -81,8 +85,9 @@ if __name__ == '__main__':
     trainset_filepaths = [os.path.join(f"{dataset_path}_trainset__", filename) for filename in os.listdir(f"{dataset_path}_trainset__") if filename.split('.')[-1] == 'gz']
     print(trainset_filepaths)
     trainset = load_dataset('csv', data_files=trainset_filepaths, streaming=True)
-    trainset = trainset.map(encode, batched=True)
-    trainset = trainset.shuffle()
+    train_columns = list(next(iter(trainset["train"])).keys())
+    trainset = trainset.map(encode, batched=True, remove_columns=train_columns)
+    trainset = trainset.shuffle(buffer_size=10000, seed=42)
 
     with open(os.path.join(f"{dataset_path}_trainset__", "info.json")) as f:
         trainset_info = json.load(f)
@@ -91,9 +96,9 @@ if __name__ == '__main__':
     testset_filepaths = [os.path.join(f"{dataset_path}_testset__", filename) for filename in os.listdir(f"{dataset_path}_testset__") if filename.split('.')[-1] == 'gz']
     print(testset_filepaths)
     testset = load_dataset('csv', data_files=testset_filepaths, streaming=True)
-    testset = testset.map(encode, batched=True)
-    testset = testset.shuffle()
-
+    test_columns = list(next(iter(testset["train"])).keys())
+    testset = testset.map(encode, batched=True, remove_columns=test_columns)
+    testset = testset.shuffle(buffer_size=10000, seed=42)
 
     model_config = BertConfig(
         vocab_size=len(tokenizer_ps.get_vocab()), max_position_embeddings=max_length,
@@ -113,6 +118,29 @@ if __name__ == '__main__':
     data_collator = DataCollatorForLanguageModeling(
         tokenizer=tokenizer_ps, mlm=True, mlm_probability=0.2
     )
+
+    steps_per_epoch = max(1, trainset_nrows // (batch_size * gpu_count))
+
+    if user_max_steps > 0:
+        max_steps = user_max_steps
+    else:
+        max_steps = steps_per_epoch * n_epochs
+
+    logging_steps = max(1, max_steps // eval_per_epoch)
+    eval_steps = max(1, max_steps // eval_per_epoch)
+    save_steps = max(1, max_steps // save_per_epoch)
+
+    print("trainset_nrows:", trainset_nrows)
+    print("gpu_count:", gpu_count)
+    print("batch_size:", batch_size)
+    print("steps_per_epoch:", steps_per_epoch)
+    print("n_epochs:", n_epochs)
+    print("max_steps:", max_steps)
+    print("logging_steps:", logging_steps)
+    print("eval_steps:", eval_steps)
+    print("save_steps:", save_steps)
+
+
     training_args = TrainingArguments(
         output_dir=model_path,
         overwrite_output_dir=True,
@@ -122,22 +150,22 @@ if __name__ == '__main__':
         bf16=True,
 
         per_device_train_batch_size=batch_size,
-        max_steps=int(trainset_nrows / (batch_size * gpu_count)) * n_epochs,
+        max_steps=max_steps,
         # num_train_epochs=n_epochs,
 
         logging_dir=os.path.join(model_path, 'logs'),
         # logging_strategy='epoch',
         logging_strategy='steps',
-        logging_steps=int(trainset_nrows / (batch_size * gpu_count * eval_per_epoch)),
+        logging_steps=logging_steps,
         # logging_steps=100,
 
         per_device_eval_batch_size=batch_size,
         evaluation_strategy='steps',
-        eval_steps=int(trainset_nrows / (batch_size * gpu_count * eval_per_epoch)),
+        eval_steps=eval_steps,
         # eval_steps=100,
 
         save_strategy='steps',
-        save_steps = int(trainset_nrows / (batch_size * gpu_count * save_per_epoch)),
+        save_steps=save_steps,
 
         # fsdp=True,
     )
@@ -146,7 +174,7 @@ if __name__ == '__main__':
         model=model, args=training_args,
         data_collator=data_collator,
         train_dataset=trainset['train'].with_format('torch'),
-        eval_dataset=testset['train'].with_format('torch'),
+        eval_dataset=testset['train'].take(max_eval_samples).with_format('torch'),
     )
     trainer.train()
     trainer.evaluate()
