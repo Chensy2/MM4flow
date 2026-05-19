@@ -14,6 +14,7 @@ import os
 import torch
 import json
 import argparse
+import gc
 
 
 class Classifier(nn.Module):
@@ -300,13 +301,14 @@ def build_model(modality, ps_config, bytes_config, num_classes):
     return model
 
 
-def make_training_args(model_dir, learning_rate, batch_size, n_epochs, label_names, bf16):
+def make_training_args(model_dir, learning_rate, batch_size, n_epochs, label_names, bf16, gradient_accumulation_steps):
     return TrainingArguments(
         output_dir=model_dir,
         learning_rate=learning_rate,
         per_device_train_batch_size=batch_size,
         num_train_epochs=n_epochs,
         per_device_eval_batch_size=batch_size,
+        gradient_accumulation_steps=gradient_accumulation_steps,
         evaluation_strategy='epoch',
         save_strategy='no',
         label_names=label_names,
@@ -320,6 +322,9 @@ if __name__ == '__main__':
     parser.add_argument('--dataset', '-D', type=str, default='dataset')
     parser.add_argument('--output', '-o', type=str, default=None)
     parser.add_argument('--batch_size', '-b', type=int, default=64)
+    parser.add_argument('--stage2_batch_size', type=int, default=None)
+    parser.add_argument('--gradient_accumulation_steps', '-ga', type=int, default=1)
+    parser.add_argument('--stage2_gradient_accumulation_steps', type=int, default=None)
     parser.add_argument('--n_epochs', '-ep', type=int, default=10)
     parser.add_argument('--learning_rate', '-lr', type=float, default=5e-5)
     parser.add_argument('--modality', '-M', choices=['mm', 'ps', 'byte'], default='mm')
@@ -334,6 +339,9 @@ if __name__ == '__main__':
     timestamp = args.timestamp
     dataset_path = args.dataset
     batch_size = args.batch_size
+    stage2_batch_size = args.stage2_batch_size or batch_size
+    gradient_accumulation_steps = args.gradient_accumulation_steps
+    stage2_gradient_accumulation_steps = args.stage2_gradient_accumulation_steps or gradient_accumulation_steps
     n_epochs = args.n_epochs
     learning_rate = args.learning_rate
     output = args.output
@@ -379,7 +387,11 @@ if __name__ == '__main__':
         'pre_timestamp_raw': pre_timestamp_raw,
         'pre_checkpoint_raw': pre_checkpoint_raw,
         'num_classes': num_classes,
-        'label2idx': label2idx
+        'label2idx': label2idx,
+        'batch_size': batch_size,
+        'stage2_batch_size': stage2_batch_size,
+        'gradient_accumulation_steps': gradient_accumulation_steps,
+        'stage2_gradient_accumulation_steps': stage2_gradient_accumulation_steps
     }
 
     ps_config, bytes_config = load_configs(modality)
@@ -399,7 +411,15 @@ if __name__ == '__main__':
     bf16 = torch.cuda.is_available()
 
     model.set_encoder_requires_grad(False)
-    training_args = make_training_args(model_dir, learning_rate, batch_size, n_epochs, label_names, bf16)
+    training_args = make_training_args(
+        model_dir,
+        learning_rate,
+        batch_size,
+        n_epochs,
+        label_names,
+        bf16,
+        gradient_accumulation_steps
+    )
     trainer = MyTrainer(
         model=model, args=training_args,
         train_dataset=trainset, eval_dataset=evalset,
@@ -407,9 +427,21 @@ if __name__ == '__main__':
         compute_metrics=compute_metrics
     )
     trainer.train()
+    del trainer
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     model.set_encoder_requires_grad(True)
-    training_args = make_training_args(model_dir, learning_rate, batch_size, n_epochs, label_names, bf16)
+    training_args = make_training_args(
+        model_dir,
+        learning_rate,
+        stage2_batch_size,
+        n_epochs,
+        label_names,
+        bf16,
+        stage2_gradient_accumulation_steps
+    )
     trainer = MyTrainer(
         model=model, args=training_args,
         train_dataset=trainset, eval_dataset=evalset,
@@ -434,6 +466,10 @@ if __name__ == '__main__':
         'type': f"BERT-{modality}-{model_type}",
         'model_type': model_type,
         'modality': modality,
+        'batch_size': batch_size,
+        'stage2_batch_size': stage2_batch_size,
+        'gradient_accumulation_steps': gradient_accumulation_steps,
+        'stage2_gradient_accumulation_steps': stage2_gradient_accumulation_steps,
         'accuracy': accuracy_score(y_true=testset['y_label'], y_pred=y_pred),
         'confusion_matrix': confusion_matrix(y_true=testset['y_label'], y_pred=y_pred).tolist(),
         'classification_report': classification_report(y_true=testset['y_label'], y_pred=y_pred, output_dict=True)
