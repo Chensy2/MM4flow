@@ -209,7 +209,7 @@ def make_encoder(modality):
 def make_dataset(df, modality, shuffle=True):
     dataset = Dataset.from_pandas(df[dataset_columns(modality)])
     dataset = dataset.map(make_encoder(modality), batched=True)
-    remove_columns = [col for col in ['fwd_raw', 'bwd_raw', 'ps', 'uid'] if col in dataset.column_names]
+    remove_columns = [col for col in ['fwd_raw', 'bwd_raw', 'uid', '__index_level_0__'] if col in dataset.column_names]
     dataset = dataset.remove_columns(remove_columns)
     dataset.set_format(type='torch', columns=tensor_columns(modality))
     return dataset.shuffle() if shuffle else dataset
