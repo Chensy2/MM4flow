@@ -302,10 +302,11 @@ if __name__ == '__main__':
     model.eval()
 
     y_pred = np.array([], dtype=np.int64)
-    for i in tqdm(range(0, testset.num_rows, batch_size), desc='Detection'):
-        batch_inputs = {k: v.to(device) for k, v in testset[i:i + batch_size].items()}
-        y_pred_tmp = model(batch_inputs)['y_logit'].argmax(1).cpu().numpy()
-        y_pred = np.concatenate([y_pred, y_pred_tmp])
+    with torch.inference_mode():
+        for i in tqdm(range(0, testset.num_rows, batch_size), desc='Detection'):
+            batch_inputs = {k: v.to(device) for k, v in testset[i:i + batch_size].items()}
+            y_pred_tmp = model(batch_inputs)['y_logit'].argmax(1).cpu().numpy()
+            y_pred = np.concatenate([y_pred, y_pred_tmp])
 
     df_test['pred'] = y_pred
     df_test['pred'] = df_test['pred'].map(idx2label)

@@ -37,6 +37,10 @@ class Classifier(nn.Module):
         self.ps_encoder.requires_grad_(requires_grad=requires_grad)
         self.bytes_encoder.requires_grad_(requires_grad=requires_grad)
 
+    def enable_gradient_checkpointing(self):
+        self.ps_encoder.gradient_checkpointing_enable()
+        self.bytes_encoder.gradient_checkpointing_enable()
+
     def forward(self, inputs):
         r = self.forward_with_attention_weight(inputs)
         return {'y_logit': r['y_logit']}
@@ -77,6 +81,9 @@ class UniModalClassifier(nn.Module):
 
     def set_encoder_requires_grad(self, requires_grad):
         self.encoder.requires_grad_(requires_grad=requires_grad)
+
+    def enable_gradient_checkpointing(self):
+        self.encoder.gradient_checkpointing_enable()
 
     def forward(self, inputs):
         if self.modality == 'ps':
@@ -322,9 +329,11 @@ if __name__ == '__main__':
     parser.add_argument('--dataset', '-D', type=str, default='dataset')
     parser.add_argument('--output', '-o', type=str, default=None)
     parser.add_argument('--batch_size', '-b', type=int, default=64)
+    parser.add_argument('--eval_batch_size', type=int, default=None)
     parser.add_argument('--stage2_batch_size', type=int, default=None)
     parser.add_argument('--gradient_accumulation_steps', '-ga', type=int, default=1)
     parser.add_argument('--stage2_gradient_accumulation_steps', type=int, default=None)
+    parser.add_argument('--gradient_checkpointing', action='store_true')
     parser.add_argument('--n_epochs', '-ep', type=int, default=10)
     parser.add_argument('--learning_rate', '-lr', type=float, default=5e-5)
     parser.add_argument('--modality', '-M', choices=['mm', 'ps', 'byte'], default='mm')
@@ -339,9 +348,11 @@ if __name__ == '__main__':
     timestamp = args.timestamp
     dataset_path = args.dataset
     batch_size = args.batch_size
+    eval_batch_size = args.eval_batch_size or batch_size
     stage2_batch_size = args.stage2_batch_size or batch_size
     gradient_accumulation_steps = args.gradient_accumulation_steps
     stage2_gradient_accumulation_steps = args.stage2_gradient_accumulation_steps or gradient_accumulation_steps
+    gradient_checkpointing = args.gradient_checkpointing
     n_epochs = args.n_epochs
     learning_rate = args.learning_rate
     output = args.output
@@ -389,9 +400,11 @@ if __name__ == '__main__':
         'num_classes': num_classes,
         'label2idx': label2idx,
         'batch_size': batch_size,
+        'eval_batch_size': eval_batch_size,
         'stage2_batch_size': stage2_batch_size,
         'gradient_accumulation_steps': gradient_accumulation_steps,
-        'stage2_gradient_accumulation_steps': stage2_gradient_accumulation_steps
+        'stage2_gradient_accumulation_steps': stage2_gradient_accumulation_steps,
+        'gradient_checkpointing': gradient_checkpointing
     }
 
     ps_config, bytes_config = load_configs(modality)
@@ -407,6 +420,8 @@ if __name__ == '__main__':
     print(model_dir)
 
     model = build_model(modality, ps_config=ps_config, bytes_config=bytes_config, num_classes=num_classes)
+    if gradient_checkpointing:
+        model.enable_gradient_checkpointing()
     label_names = tensor_columns(modality)
     bf16 = torch.cuda.is_available()
 
@@ -451,13 +466,18 @@ if __name__ == '__main__':
     trainer.train()
     trainer.save_state()
     torch.save(model.state_dict(), os.path.join(model_dir, "pytorch_model.bin"))
+    del trainer
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     model.eval()
     y_pred = np.array([], dtype=np.int64)
-    for i in tqdm(range(0, testset.num_rows, batch_size)):
-        batch_inputs = {k: v.to(device) for k, v in testset[i:i + batch_size].items()}
-        y_pred_tmp = model(batch_inputs)['y_logit'].argmax(1).cpu().numpy()
-        y_pred = np.concatenate([y_pred, y_pred_tmp])
+    with torch.inference_mode():
+        for i in tqdm(range(0, testset.num_rows, eval_batch_size)):
+            batch_inputs = {k: v.to(device) for k, v in testset[i:i + eval_batch_size].items()}
+            y_pred_tmp = model(batch_inputs)['y_logit'].argmax(1).cpu().numpy()
+            y_pred = np.concatenate([y_pred, y_pred_tmp])
     print(accuracy_score(y_true=testset['y_label'], y_pred=y_pred))
     print(confusion_matrix(y_true=testset['y_label'], y_pred=y_pred))
     print(classification_report(y_true=testset['y_label'], y_pred=y_pred, digits=4, target_names=labels))
@@ -467,9 +487,11 @@ if __name__ == '__main__':
         'model_type': model_type,
         'modality': modality,
         'batch_size': batch_size,
+        'eval_batch_size': eval_batch_size,
         'stage2_batch_size': stage2_batch_size,
         'gradient_accumulation_steps': gradient_accumulation_steps,
         'stage2_gradient_accumulation_steps': stage2_gradient_accumulation_steps,
+        'gradient_checkpointing': gradient_checkpointing,
         'accuracy': accuracy_score(y_true=testset['y_label'], y_pred=y_pred),
         'confusion_matrix': confusion_matrix(y_true=testset['y_label'], y_pred=y_pred).tolist(),
         'classification_report': classification_report(y_true=testset['y_label'], y_pred=y_pred, output_dict=True)
