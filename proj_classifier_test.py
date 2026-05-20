@@ -44,10 +44,10 @@ class Classifier(nn.Module):
         outputs = torch.concat([ps_outputs.last_hidden_state, raw_outputs.last_hidden_state], dim=1)
         key_padding_mask = (1 - torch.concat([inputs['ps_attention_mask'], inputs['raw_attention_mask']], dim=1)).bool()
         ps_attn_output, ps_attn_output_weights = self.ps_cross_attention(
-            ps_outputs.last_hidden_state, outputs, outputs, key_padding_mask=key_padding_mask
+            ps_outputs.last_hidden_state, outputs, outputs, key_padding_mask=key_padding_mask, need_weights=False
         )
         raw_attn_output, raw_attn_output_weights = self.bytes_cross_attention(
-            raw_outputs.last_hidden_state, outputs, outputs, key_padding_mask=key_padding_mask
+            raw_outputs.last_hidden_state, outputs, outputs, key_padding_mask=key_padding_mask, need_weights=False
         )
 
         memory_ps, memory_raw = ps_attn_output[:, 0, :], raw_attn_output[:, 0, :]
