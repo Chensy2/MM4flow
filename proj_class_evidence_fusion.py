@@ -1,0 +1,574 @@
+from datasets import Dataset
+from transformers import BertConfig, BertForMaskedLM, BertTokenizerFast
+from torch import nn
+from sklearn.metrics import accuracy_score
+from tqdm import tqdm
+import argparse
+import json
+import os
+import numpy as np
+import pandas as pd
+import torch
+
+
+class UniModalClassifier(nn.Module):
+    def __init__(self, config, num_classes, modality):
+        super(UniModalClassifier, self).__init__()
+        if modality not in ['ps', 'byte']:
+            raise ValueError(f"Unsupported modality: {modality}")
+        self.modality = modality
+        self.encoder = BertForMaskedLM(config)
+        self.classifier = nn.Linear(config.hidden_size, num_classes)
+
+    def forward(self, inputs, return_features=False):
+        if self.modality == 'ps':
+            outputs = self.encoder.bert(input_ids=inputs['ps'], attention_mask=inputs['ps_attention_mask'])
+        else:
+            outputs = self.encoder.bert(
+                input_ids=inputs['raw'],
+                attention_mask=inputs['raw_attention_mask'],
+                token_type_ids=inputs['raw_token_type_ids']
+            )
+        features = outputs.last_hidden_state[:, 0, :]
+        logits = self.classifier(features)
+        if return_features:
+            return {'logits': logits, 'features': features}
+        return {'logits': logits}
+
+
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
+max_length_ps = 256
+max_length_bytes = 512
+min_pkts = 5
+model_name = "MM4flow"
+premodel_name_ps = 'BERT-ps'
+premodel_name_raw = 'BERT-bytes'
+
+tokenizer_ps = BertTokenizerFast.from_pretrained('tokenizer_bert/ps_tokenizer')
+tokenizer_bytes = BertTokenizerFast.from_pretrained('tokenizer_bert/bytes_tokenizer')
+drop_empty = lambda x: x if x != '(empty)' else np.nan
+
+
+def func_ps(ps):
+    r = []
+    for burst in str(ps).split(','):
+        if not burst or burst == '(empty)':
+            continue
+        p_len, p_count = burst.split(':')
+        r += [f"p{p_len}t"] * int(p_count)
+        if len(r) > max_length_ps:
+            break
+    return ' '.join(r[0:max_length_ps])
+
+
+def func_bytes(s):
+    s = '' if pd.isna(s) else str(s)
+    return ' '.join([s[i:i + 2] for i in range(0, len(s), 2)])
+
+
+def preprocess_dataframe(df, modality, label2idx=None):
+    df = df.copy()
+    if 'up' in df.columns and 'down' in df.columns:
+        df = df[df['up'] + df['down'] >= min_pkts].copy()
+
+    if modality == 'ps':
+        df['ps'] = df['ps'].apply(func_ps)
+    elif modality == 'byte':
+        df['fwd_raw'] = df['fwd_raw'].apply(drop_empty).fillna(' ').apply(func_bytes)
+        df['bwd_raw'] = df['bwd_raw'].apply(drop_empty).fillna(' ').apply(func_bytes)
+    else:
+        raise ValueError(f"Unsupported modality: {modality}")
+
+    if label2idx is not None and 'label' in df.columns:
+        df['y_label'] = df['label'].map(label2idx)
+    return df
+
+
+def dataset_columns(modality, has_label):
+    label_cols = ['y_label'] if has_label else []
+    if modality == 'ps':
+        return ['ps'] + label_cols
+    return ['fwd_raw', 'bwd_raw'] + label_cols
+
+
+def tensor_columns(modality, has_label):
+    label_cols = ['y_label'] if has_label else []
+    if modality == 'ps':
+        return ['ps', 'ps_attention_mask'] + label_cols
+    return ['raw', 'raw_attention_mask', 'raw_token_type_ids'] + label_cols
+
+
+def make_encoder(modality):
+    def encode(examples):
+        if modality == 'ps':
+            ps = tokenizer_ps(
+                examples['ps'],
+                truncation=True,
+                padding='max_length',
+                max_length=max_length_ps,
+                return_special_tokens_mask=True
+            )
+            return {'ps': ps['input_ids'], 'ps_attention_mask': ps['attention_mask']}
+
+        raw = tokenizer_bytes(
+            list(zip(examples['fwd_raw'], examples['bwd_raw'])),
+            truncation=True,
+            padding='max_length',
+            max_length=max_length_bytes,
+            return_special_tokens_mask=True
+        )
+        return {
+            'raw': raw['input_ids'],
+            'raw_attention_mask': raw['attention_mask'],
+            'raw_token_type_ids': raw['token_type_ids']
+        }
+
+    return encode
+
+
+def make_dataset(df, modality, has_label):
+    dataset = Dataset.from_pandas(df[dataset_columns(modality, has_label)])
+    dataset = dataset.map(make_encoder(modality), batched=True)
+    remove_columns = [col for col in ['fwd_raw', 'bwd_raw', 'uid', '__index_level_0__'] if col in dataset.column_names]
+    dataset = dataset.remove_columns(remove_columns)
+    dataset.set_format(type='torch', columns=tensor_columns(modality, has_label))
+    return dataset
+
+
+def load_model_info(model_ts):
+    model_path = os.path.join('model-classifier', model_ts)
+    with open(os.path.join(model_path, model_name, 'info.json')) as f:
+        info = json.load(f)
+    return model_path, info
+
+
+def assert_label_maps_match(ps_info, byte_info):
+    if ps_info['label2idx'] != byte_info['label2idx']:
+        raise ValueError('ps and byte model label2idx mappings do not match.')
+    if ps_info.get('modality') != 'ps':
+        raise ValueError(f"ps_model_ts must point to a ps model, got {ps_info.get('modality')}")
+    if byte_info.get('modality') != 'byte':
+        raise ValueError(f"byte_model_ts must point to a byte model, got {byte_info.get('modality')}")
+
+
+def load_config(modality, info):
+    if modality == 'ps':
+        pre_timestamp = info['pre_timestamp_ps']
+        with open(os.path.join('model', f'{premodel_name_ps}_{pre_timestamp}', 'hyperparameters.json')) as f:
+            hyper = json.load(f)
+        return BertConfig(
+            vocab_size=len(tokenizer_ps.get_vocab()), max_position_embeddings=max_length_ps,
+            hidden_size=hyper['d_model'], num_hidden_layers=hyper['n_layer'],
+            num_attention_heads=hyper['n_head'], intermediate_size=hyper['dim_ff'],
+        )
+
+    pre_timestamp = info['pre_timestamp_raw']
+    with open(os.path.join('model', f'{premodel_name_raw}_{pre_timestamp}', 'hyperparameters.json')) as f:
+        hyper = json.load(f)
+    return BertConfig(
+        vocab_size=len(tokenizer_bytes.get_vocab()), max_position_embeddings=max_length_bytes,
+        hidden_size=hyper['d_model'], num_hidden_layers=hyper['n_layer'],
+        num_attention_heads=hyper['n_head'], intermediate_size=hyper['dim_ff'],
+    )
+
+
+def load_unimodal_model(model_path, info, modality, num_classes):
+    config = load_config(modality, info)
+    model = UniModalClassifier(config, num_classes=num_classes, modality=modality).to(device)
+    model_type = info.get('model_type', f'{modality}-finetune')
+    model_dir = os.path.join(model_path, model_name, model_type)
+    state_path = os.path.join(model_dir, 'pytorch_model.bin')
+    model.load_state_dict(torch.load(state_path, map_location=device))
+    model.eval()
+    return model
+
+
+def collect_outputs(model, dataset, batch_size, desc):
+    logits_list, probs_list, features_list = [], [], []
+    with torch.inference_mode():
+        for i in tqdm(range(0, dataset.num_rows, batch_size), desc=desc):
+            batch_inputs = {k: v.to(device) for k, v in dataset[i:i + batch_size].items() if k != 'y_label'}
+            output = model(batch_inputs, return_features=True)
+            logits = output['logits'].float().cpu()
+            probs = torch.softmax(logits, dim=-1)
+            logits_list.append(logits.numpy())
+            probs_list.append(probs.numpy())
+            features_list.append(output['features'].float().cpu().numpy())
+
+    return {
+        'logits': np.concatenate(logits_list, axis=0),
+        'probs': np.concatenate(probs_list, axis=0),
+        'features': np.concatenate(features_list, axis=0),
+    }
+
+
+def safe_accuracy(y_true, y_pred, mask=None):
+    if mask is None:
+        mask = np.ones_like(y_true, dtype=bool)
+    if mask.sum() == 0:
+        return None
+    return float(accuracy_score(y_true[mask], y_pred[mask]))
+
+
+def per_class_recall(y_true, y_pred, num_classes, mask):
+    recalls = np.zeros(num_classes, dtype=np.float64)
+    supports = np.zeros(num_classes, dtype=np.int64)
+    for c in range(num_classes):
+        c_mask = mask & (y_true == c)
+        supports[c] = int(c_mask.sum())
+        if supports[c] > 0:
+            recalls[c] = float((y_pred[c_mask] == c).mean())
+        else:
+            recalls[c] = np.nan
+    return recalls, supports
+
+
+def class_oracle_predictions(y_true, pred_ps, pred_byte, num_classes, mask):
+    recall_ps, supports = per_class_recall(y_true, pred_ps, num_classes, mask)
+    recall_byte, _ = per_class_recall(y_true, pred_byte, num_classes, mask)
+    best_view = np.where(np.nan_to_num(recall_ps, nan=-1.0) >= np.nan_to_num(recall_byte, nan=-1.0), 'ps', 'byte')
+    y_oracle = pred_ps.copy()
+    known_idx = np.where(mask)[0]
+    y_oracle[known_idx] = np.where(best_view[y_true[known_idx]] == 'ps', pred_ps[known_idx], pred_byte[known_idx])
+    return y_oracle, best_view, recall_ps, recall_byte, supports
+
+
+def sample_oracle_predictions(y_true, pred_ps, pred_byte):
+    y_oracle = pred_ps.copy()
+    ps_wrong_byte_right = (pred_ps != y_true) & (pred_byte == y_true)
+    y_oracle[ps_wrong_byte_right] = pred_byte[ps_wrong_byte_right]
+    return y_oracle
+
+
+def robust_zscore(values, eps=1e-6):
+    values = values.astype(np.float64)
+    median = np.nanmedian(values)
+    mad = np.nanmedian(np.abs(values - median))
+    scale = 1.4826 * mad
+    if not np.isfinite(scale) or scale < eps:
+        scale = np.nanstd(values)
+    if not np.isfinite(scale) or scale < eps:
+        return np.zeros_like(values, dtype=np.float64)
+    return (values - median) / (scale + eps)
+
+
+def softmax_np(values, axis=0, tau=1.0):
+    scaled = values / max(tau, 1e-8)
+    scaled = scaled - np.nanmax(scaled, axis=axis, keepdims=True)
+    exp = np.exp(scaled)
+    exp = np.where(np.isfinite(exp), exp, 0.0)
+    denom = exp.sum(axis=axis, keepdims=True)
+    return exp / np.maximum(denom, 1e-12)
+
+
+def aggregate_values(values, method):
+    values = np.asarray(values, dtype=np.float64)
+    values = values[np.isfinite(values)]
+    if len(values) == 0:
+        return np.nan
+    if method == 'mean':
+        return float(np.mean(values))
+    if method == 'median':
+        return float(np.median(values))
+    if method == 'trimmed_mean':
+        if len(values) < 5:
+            return float(np.mean(values))
+        values = np.sort(values)
+        k = max(1, int(0.1 * len(values)))
+        if 2 * k >= len(values):
+            return float(np.mean(values))
+        return float(np.mean(values[k:-k]))
+    raise ValueError(f"Unsupported aggregate: {method}")
+
+
+def source_priors(y_source, num_classes):
+    counts = np.bincount(y_source, minlength=num_classes).astype(np.float64)
+    return counts / max(counts.sum(), 1.0)
+
+
+def penalties(pred, num_classes, source_prior, w_prior, w_collapse, w_support):
+    pred_counts = np.bincount(pred, minlength=num_classes).astype(np.float64)
+    pred_prior = pred_counts / max(pred_counts.sum(), 1.0)
+    expected_support = 1.0 / max(num_classes, 1)
+    low_support = np.maximum(0.0, expected_support - pred_prior) / max(expected_support, 1e-12)
+    prior_shift = np.abs(pred_prior - source_prior)
+    collapse = np.maximum(0.0, pred_prior - source_prior)
+    return w_prior * prior_shift + w_collapse * collapse + w_support * low_support
+
+
+def prob_only_evidence(probs, pred, num_classes, source_prior, args):
+    h = np.zeros(num_classes, dtype=np.float64)
+    for c in range(num_classes):
+        mask = pred == c
+        if mask.any():
+            h[c] = float(np.mean(probs[mask, c]))
+        else:
+            h[c] = 0.0
+    return h - penalties(pred, num_classes, source_prior, args.w_prior, args.w_collapse, args.w_support)
+
+
+def fit_diagonal_gaussians(features, labels, num_classes, var_eps):
+    dim = features.shape[1]
+    means = np.zeros((num_classes, dim), dtype=np.float64)
+    variances = np.ones((num_classes, dim), dtype=np.float64)
+    global_var = np.var(features, axis=0) + var_eps
+    for c in range(num_classes):
+        c_features = features[labels == c]
+        if len(c_features) == 0:
+            means[c] = np.mean(features, axis=0)
+            variances[c] = global_var
+        elif len(c_features) == 1:
+            means[c] = c_features[0]
+            variances[c] = global_var
+        else:
+            means[c] = np.mean(c_features, axis=0)
+            variances[c] = np.var(c_features, axis=0) + var_eps
+    return means, variances
+
+
+def mahalanobis_distances(features, means, variances):
+    distances = []
+    for c in range(means.shape[0]):
+        diff = features - means[c]
+        distances.append(np.mean((diff * diff) / variances[c], axis=1))
+    return np.stack(distances, axis=1)
+
+
+def geometry_evidence(source_features, source_labels, target_features, pred, num_classes, source_prior, args):
+    means, variances = fit_diagonal_gaussians(source_features, source_labels, num_classes, args.var_eps)
+    distances = mahalanobis_distances(target_features, means, variances)
+    neg_dist_z = np.zeros_like(distances)
+    margin_z = np.zeros_like(distances)
+
+    for c in range(num_classes):
+        other = np.delete(distances, c, axis=1)
+        nearest_other = np.min(other, axis=1)
+        margin = nearest_other - distances[:, c]
+        neg_dist_z[:, c] = robust_zscore(-distances[:, c])
+        margin_z[:, c] = robust_zscore(margin)
+
+    sample_evidence = neg_dist_z + margin_z
+    h = np.zeros(num_classes, dtype=np.float64)
+    for c in range(num_classes):
+        mask = pred == c
+        h[c] = aggregate_values(sample_evidence[mask, c], args.aggregate) if mask.any() else 0.0
+
+    h = h - penalties(pred, num_classes, source_prior, args.w_prior, args.w_collapse, args.w_support)
+    return h, distances, sample_evidence
+
+
+def fuse_probs(weights, probs_ps, probs_byte):
+    fused = weights[0][None, :] * probs_ps + weights[1][None, :] * probs_byte
+    fused = fused / np.maximum(fused.sum(axis=1, keepdims=True), 1e-12)
+    return fused
+
+
+def corr_ignore_nan(a, b):
+    a = np.asarray(a, dtype=np.float64)
+    b = np.asarray(b, dtype=np.float64)
+    mask = np.isfinite(a) & np.isfinite(b)
+    if mask.sum() < 2:
+        return None
+    if np.std(a[mask]) < 1e-12 or np.std(b[mask]) < 1e-12:
+        return None
+    return float(np.corrcoef(a[mask], b[mask])[0, 1])
+
+
+def write_weights(path, weights, h_values, idx2label):
+    rows = []
+    for c, label in idx2label.items():
+        rows.append({
+            'class_idx': c,
+            'label': label,
+            'H_ps': h_values[0, c],
+            'H_byte': h_values[1, c],
+            'W_ps': weights[0, c],
+            'W_byte': weights[1, c],
+            'selected_view': 'ps' if weights[0, c] >= weights[1, c] else 'byte',
+        })
+    pd.DataFrame(rows).to_csv(path, index=False)
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--source_dataset', required=True)
+    parser.add_argument('--target_csv', required=True)
+    parser.add_argument('--ps_model_ts', required=True)
+    parser.add_argument('--byte_model_ts', required=True)
+    parser.add_argument('--output_dir', required=True)
+    parser.add_argument('--batch_size', '-b', type=int, default=64)
+    parser.add_argument('--tau', type=float, default=1.0)
+    parser.add_argument('--aggregate', choices=['mean', 'median', 'trimmed_mean'], default='mean')
+    parser.add_argument('--w_prior', type=float, default=0.5)
+    parser.add_argument('--w_collapse', type=float, default=0.5)
+    parser.add_argument('--w_support', type=float, default=0.2)
+    parser.add_argument('--var_eps', type=float, default=1e-4)
+    parser.add_argument('--max_source_samples', type=int, default=None)
+    parser.add_argument('--max_target_samples', type=int, default=None)
+    args = parser.parse_args()
+
+    os.makedirs(args.output_dir, exist_ok=True)
+
+    ps_model_path, ps_info = load_model_info(args.ps_model_ts)
+    byte_model_path, byte_info = load_model_info(args.byte_model_ts)
+    assert_label_maps_match(ps_info, byte_info)
+
+    label2idx = ps_info['label2idx']
+    idx2label = {idx: label for label, idx in label2idx.items()}
+    idx2label = dict(sorted(idx2label.items(), key=lambda item: item[0]))
+    num_classes = len(label2idx)
+
+    source_df = pd.read_csv(os.path.join(args.source_dataset, 'train.csv.gz'), compression='gzip', index_col=0)
+    target_df = pd.read_csv(args.target_csv, compression='gzip', index_col=0)
+    if args.max_source_samples is not None:
+        source_df = source_df.head(args.max_source_samples)
+    if args.max_target_samples is not None:
+        target_df = target_df.head(args.max_target_samples)
+
+    source_ps_df = preprocess_dataframe(source_df, 'ps', label2idx)
+    source_byte_df = preprocess_dataframe(source_df, 'byte', label2idx)
+    target_ps_df = preprocess_dataframe(target_df, 'ps', label2idx)
+    target_byte_df = preprocess_dataframe(target_df, 'byte', label2idx)
+
+    if len(target_ps_df) != len(target_byte_df):
+        raise ValueError(f"Target sample mismatch after preprocessing: ps={len(target_ps_df)}, byte={len(target_byte_df)}")
+    if len(source_ps_df) != len(source_byte_df):
+        raise ValueError(f"Source sample mismatch after preprocessing: ps={len(source_ps_df)}, byte={len(source_byte_df)}")
+
+    source_mask = source_ps_df['y_label'].notna().to_numpy()
+    target_known_mask = target_ps_df['y_label'].notna().to_numpy() if 'y_label' in target_ps_df.columns else np.zeros(len(target_ps_df), dtype=bool)
+    y_source = source_ps_df['y_label'].fillna(-1).astype(int).to_numpy()
+    y_target = target_ps_df['y_label'].fillna(-1).astype(int).to_numpy()
+
+    source_ps_dataset = make_dataset(source_ps_df, 'ps', has_label=True)
+    source_byte_dataset = make_dataset(source_byte_df, 'byte', has_label=True)
+    target_ps_dataset = make_dataset(target_ps_df, 'ps', has_label='label' in target_ps_df.columns)
+    target_byte_dataset = make_dataset(target_byte_df, 'byte', has_label='label' in target_byte_df.columns)
+
+    ps_model = load_unimodal_model(ps_model_path, ps_info, 'ps', num_classes)
+    byte_model = load_unimodal_model(byte_model_path, byte_info, 'byte', num_classes)
+
+    source_ps = collect_outputs(ps_model, source_ps_dataset, args.batch_size, 'source ps')
+    source_byte = collect_outputs(byte_model, source_byte_dataset, args.batch_size, 'source byte')
+    target_ps = collect_outputs(ps_model, target_ps_dataset, args.batch_size, 'target ps')
+    target_byte = collect_outputs(byte_model, target_byte_dataset, args.batch_size, 'target byte')
+
+    pred_ps = target_ps['probs'].argmax(axis=1)
+    pred_byte = target_byte['probs'].argmax(axis=1)
+    pred_avg = ((target_ps['probs'] + target_byte['probs']) / 2.0).argmax(axis=1)
+
+    y_class_oracle, class_best_view, recall_ps, recall_byte, target_supports = class_oracle_predictions(
+        y_target, pred_ps, pred_byte, num_classes, target_known_mask
+    )
+    y_sample_oracle = sample_oracle_predictions(y_target, pred_ps, pred_byte)
+
+    src_prior = source_priors(y_source[source_mask], num_classes)
+    h_prob_ps = prob_only_evidence(target_ps['probs'], pred_ps, num_classes, src_prior, args)
+    h_prob_byte = prob_only_evidence(target_byte['probs'], pred_byte, num_classes, src_prior, args)
+    h_prob = np.stack([h_prob_ps, h_prob_byte], axis=0)
+    weights_prob = softmax_np(h_prob, axis=0, tau=args.tau)
+    probs_prob = fuse_probs(weights_prob, target_ps['probs'], target_byte['probs'])
+    pred_prob = probs_prob.argmax(axis=1)
+
+    h_geo_ps, _, _ = geometry_evidence(
+        source_ps['features'][source_mask], y_source[source_mask],
+        target_ps['features'], pred_ps, num_classes, src_prior, args
+    )
+    h_geo_byte, _, _ = geometry_evidence(
+        source_byte['features'][source_mask], y_source[source_mask],
+        target_byte['features'], pred_byte, num_classes, src_prior, args
+    )
+    h_geo = np.stack([h_geo_ps, h_geo_byte], axis=0)
+    weights_geo = softmax_np(h_geo, axis=0, tau=args.tau)
+    probs_geo = fuse_probs(weights_geo, target_ps['probs'], target_byte['probs'])
+    pred_geo = probs_geo.argmax(axis=1)
+
+    prob_selected = np.where(weights_prob[0] >= weights_prob[1], 'ps', 'byte')
+    geo_selected = np.where(weights_geo[0] >= weights_geo[1], 'ps', 'byte')
+    health_best_view_match_rate_prob = float((prob_selected == class_best_view).mean())
+    health_best_view_match_rate_geo = float((geo_selected == class_best_view).mean())
+
+    per_rows = []
+    for c, label in idx2label.items():
+        per_rows.append({
+            'class_idx': c,
+            'label': label,
+            'support': int(target_supports[c]),
+            'ps_recall': recall_ps[c],
+            'byte_recall': recall_byte[c],
+            'best_recall_view': class_best_view[c],
+            'H_prob_ps': h_prob[0, c],
+            'H_prob_byte': h_prob[1, c],
+            'W_prob_ps': weights_prob[0, c],
+            'W_prob_byte': weights_prob[1, c],
+            'prob_selected_view': prob_selected[c],
+            'H_geo_ps': h_geo[0, c],
+            'H_geo_byte': h_geo[1, c],
+            'W_geo_ps': weights_geo[0, c],
+            'W_geo_byte': weights_geo[1, c],
+            'geo_selected_view': geo_selected[c],
+        })
+    per_class_df = pd.DataFrame(per_rows)
+
+    h_prob_best = np.where(class_best_view == 'ps', h_prob[0], h_prob[1])
+    h_geo_best = np.where(class_best_view == 'ps', h_geo[0], h_geo[1])
+    best_recall = np.where(class_best_view == 'ps', recall_ps, recall_byte)
+    summary = {
+        'source_dataset': args.source_dataset,
+        'target_csv': args.target_csv,
+        'ps_model_ts': args.ps_model_ts,
+        'byte_model_ts': args.byte_model_ts,
+        'num_classes': num_classes,
+        'num_source_samples': int(len(source_ps_df)),
+        'num_target_samples': int(len(target_ps_df)),
+        'num_target_known_label_samples': int(target_known_mask.sum()),
+        'ps_acc': safe_accuracy(y_target, pred_ps, target_known_mask),
+        'byte_acc': safe_accuracy(y_target, pred_byte, target_known_mask),
+        'best_single_acc': max(
+            safe_accuracy(y_target, pred_ps, target_known_mask) or 0.0,
+            safe_accuracy(y_target, pred_byte, target_known_mask) or 0.0
+        ),
+        'avg_prob_acc': safe_accuracy(y_target, pred_avg, target_known_mask),
+        'prob_only_class_fusion_acc': safe_accuracy(y_target, pred_prob, target_known_mask),
+        'geometry_class_fusion_acc': safe_accuracy(y_target, pred_geo, target_known_mask),
+        'class_oracle_acc': safe_accuracy(y_target, y_class_oracle, target_known_mask),
+        'sample_oracle_acc': safe_accuracy(y_target, y_sample_oracle, target_known_mask),
+        'health_best_view_match_rate_prob': health_best_view_match_rate_prob,
+        'health_best_view_match_rate_geo': health_best_view_match_rate_geo,
+        'corr_h_prob_selected_with_best_recall': corr_ignore_nan(h_prob_best, best_recall),
+        'corr_h_geo_selected_with_best_recall': corr_ignore_nan(h_geo_best, best_recall),
+        'warnings': [],
+    }
+    if summary['sample_oracle_acc'] is not None and summary['sample_oracle_acc'] + 1e-12 < summary['best_single_acc']:
+        summary['warnings'].append('sample_oracle_acc is lower than best_single_acc; check labels/predictions.')
+    if summary['class_oracle_acc'] is not None and summary['class_oracle_acc'] + 1e-12 < summary['best_single_acc']:
+        summary['warnings'].append('class_oracle_acc is lower than best_single_acc; this may happen if target has missing classes.')
+
+    target_out = target_ps_df.copy()
+    target_out['y_true_idx'] = y_target
+    target_out['pred_ps_idx'] = pred_ps
+    target_out['pred_byte_idx'] = pred_byte
+    target_out['pred_avg_idx'] = pred_avg
+    target_out['pred_prob_only_idx'] = pred_prob
+    target_out['pred_geometry_idx'] = pred_geo
+    target_out['pred_ps'] = [idx2label[i] for i in pred_ps]
+    target_out['pred_byte'] = [idx2label[i] for i in pred_byte]
+    target_out['pred_avg'] = [idx2label[i] for i in pred_avg]
+    target_out['pred_prob_only'] = [idx2label[i] for i in pred_prob]
+    target_out['pred_geometry'] = [idx2label[i] for i in pred_geo]
+    for c, label in idx2label.items():
+        target_out[f'prob_ps_{label}'] = target_ps['probs'][:, c]
+        target_out[f'prob_byte_{label}'] = target_byte['probs'][:, c]
+
+    with open(os.path.join(args.output_dir, 'summary.json'), 'w') as f:
+        json.dump(summary, f, indent=2)
+    per_class_df.to_csv(os.path.join(args.output_dir, 'per_class_metrics.csv'), index=False)
+    target_out.to_csv(os.path.join(args.output_dir, 'target_predictions.csv'), index=False)
+    write_weights(os.path.join(args.output_dir, 'class_weights_prob.csv'), weights_prob, h_prob, idx2label)
+    write_weights(os.path.join(args.output_dir, 'class_weights_geometry.csv'), weights_geo, h_geo, idx2label)
+
+    print(json.dumps(summary, indent=2))
+
+
+if __name__ == '__main__':
+    main()
