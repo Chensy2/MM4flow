@@ -219,8 +219,10 @@ def load_logs(rootdir, modality):
 
 
 def preprocess_dataframe(df, modality):
-    if modality in ['mm', 'ps']:
+    if 'up' in df.columns and 'down' in df.columns:
         df = df[df['up'] + df['down'] >= min_pkts]
+
+    if modality in ['mm', 'ps']:
         df['ps'] = df['ps'].apply(func_ps)
     if modality in ['mm', 'byte']:
         df['fwd_raw'] = df['fwd_raw'].apply(drop_empty).fillna(' ').apply(func_bytes)
