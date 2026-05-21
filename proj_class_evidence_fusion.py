@@ -1,7 +1,7 @@
 from datasets import Dataset
 from transformers import BertConfig, BertForMaskedLM, BertTokenizerFast
 from torch import nn
-from sklearn.metrics import accuracy_score
+from sklearn.metrics import accuracy_score, classification_report
 from tqdm import tqdm
 import argparse
 import json
@@ -174,11 +174,25 @@ def load_config(modality, info):
 
 def load_unimodal_model(model_path, info, modality, num_classes):
     config = load_config(modality, info)
-    model = UniModalClassifier(config, num_classes=num_classes, modality=modality).to(device)
     model_type = info.get('model_type', f'{modality}-finetune')
     model_dir = os.path.join(model_path, model_name, model_type)
     state_path = os.path.join(model_dir, 'pytorch_model.bin')
-    model.load_state_dict(torch.load(state_path, map_location=device))
+    state_dict = torch.load(state_path, map_location=device)
+    classifier_weight = state_dict.get('classifier.weight')
+    if classifier_weight is None:
+        raise ValueError(f"Missing classifier.weight in checkpoint: {state_path}")
+    checkpoint_num_classes = classifier_weight.shape[0]
+    if checkpoint_num_classes != num_classes:
+        raise ValueError(
+            f"Label/checkpoint mismatch for {modality} model.\n"
+            f"info.json has {num_classes} classes, but checkpoint classifier has {checkpoint_num_classes} classes.\n"
+            f"model_path={model_path}\n"
+            f"state_path={state_path}\n"
+            f"Likely causes: wrong --{modality}_model_ts, reused OUTPUT_NAME/RUN_TS, or info.json overwritten by another dataset."
+        )
+
+    model = UniModalClassifier(config, num_classes=num_classes, modality=modality).to(device)
+    model.load_state_dict(state_dict)
     model.eval()
     return model
 
@@ -389,12 +403,105 @@ def write_weights(path, weights, h_values, idx2label):
     pd.DataFrame(rows).to_csv(path, index=False)
 
 
+def build_classification_reports(y_true, predictions, idx2label, known_mask):
+    labels = list(idx2label.keys())
+    target_names = [idx2label[i] for i in labels]
+    report_texts = {}
+    report_dicts = {}
+    report_rows = []
+
+    for name, y_pred in predictions.items():
+        text = classification_report(
+            y_true[known_mask],
+            y_pred[known_mask],
+            labels=labels,
+            target_names=target_names,
+            digits=4,
+            zero_division=0,
+        )
+        report = classification_report(
+            y_true[known_mask],
+            y_pred[known_mask],
+            labels=labels,
+            target_names=target_names,
+            digits=4,
+            zero_division=0,
+            output_dict=True,
+        )
+        report_texts[name] = text
+        report_dicts[name] = report
+
+        for label_name, metrics in report.items():
+            if isinstance(metrics, dict):
+                row = {'method': name, 'label': label_name}
+                row.update(metrics)
+                report_rows.append(row)
+            else:
+                report_rows.append({'method': name, 'label': label_name, 'accuracy': metrics})
+
+    return report_texts, report_dicts, pd.DataFrame(report_rows)
+
+
+def write_classification_reports(output_dir, report_texts, report_dicts, report_df):
+    with open(os.path.join(output_dir, 'classification_reports.txt'), 'w') as f:
+        for name, text in report_texts.items():
+            f.write(f"===== {name} =====\n")
+            f.write(text)
+            f.write("\n\n")
+    with open(os.path.join(output_dir, 'classification_reports.json'), 'w') as f:
+        json.dump(report_dicts, f, indent=2)
+    report_df.to_csv(os.path.join(output_dir, 'classification_reports.csv'), index=False)
+
+
+def report_only_from_existing_outputs(output_dir):
+    pred_path = os.path.join(output_dir, 'target_predictions.csv')
+    weight_path = os.path.join(output_dir, 'class_weights_prob.csv')
+    if not os.path.exists(pred_path):
+        raise FileNotFoundError(f"Missing {pred_path}; run full fusion first or pass the correct --output_dir.")
+    if not os.path.exists(weight_path):
+        raise FileNotFoundError(f"Missing {weight_path}; it is used to recover class_idx -> label mapping.")
+
+    target_out = pd.read_csv(pred_path)
+    weights = pd.read_csv(weight_path)
+    idx2label = dict(zip(weights['class_idx'].astype(int), weights['label'].astype(str)))
+    idx2label = dict(sorted(idx2label.items(), key=lambda item: item[0]))
+
+    y_true = target_out['y_true_idx'].fillna(-1).astype(int).to_numpy()
+    known_mask = y_true >= 0
+    prediction_columns = {
+        'ps': 'pred_ps_idx',
+        'byte': 'pred_byte_idx',
+        'avg_prob': 'pred_avg_idx',
+        'prob_only_class_fusion': 'pred_prob_only_idx',
+        'geometry_class_fusion': 'pred_geometry_idx',
+        'class_oracle': 'pred_class_oracle_idx',
+        'sample_oracle': 'pred_sample_oracle_idx',
+    }
+    predictions = {}
+    for name, column in prediction_columns.items():
+        if column in target_out.columns:
+            predictions[name] = target_out[column].astype(int).to_numpy()
+    if 'class_oracle' not in predictions and {'ps', 'byte'} <= set(predictions.keys()):
+        y_class_oracle, _, _, _, _ = class_oracle_predictions(
+            y_true, predictions['ps'], predictions['byte'], len(idx2label), known_mask
+        )
+        predictions['class_oracle'] = y_class_oracle
+    if 'sample_oracle' not in predictions and {'ps', 'byte'} <= set(predictions.keys()):
+        predictions['sample_oracle'] = sample_oracle_predictions(y_true, predictions['ps'], predictions['byte'])
+
+    report_texts, report_dicts, report_df = build_classification_reports(
+        y_true, predictions, idx2label, known_mask
+    )
+    write_classification_reports(output_dir, report_texts, report_dicts, report_df)
+    print(f"saved classification reports under: {output_dir}")
+
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--source_dataset', required=True)
-    parser.add_argument('--target_csv', required=True)
-    parser.add_argument('--ps_model_ts', required=True)
-    parser.add_argument('--byte_model_ts', required=True)
+    parser.add_argument('--source_dataset')
+    parser.add_argument('--target_csv')
+    parser.add_argument('--ps_model_ts')
+    parser.add_argument('--byte_model_ts')
     parser.add_argument('--output_dir', required=True)
     parser.add_argument('--batch_size', '-b', type=int, default=64)
     parser.add_argument('--tau', type=float, default=1.0)
@@ -405,9 +512,21 @@ def main():
     parser.add_argument('--var_eps', type=float, default=1e-4)
     parser.add_argument('--max_source_samples', type=int, default=None)
     parser.add_argument('--max_target_samples', type=int, default=None)
+    parser.add_argument(
+        '--report_only',
+        action='store_true',
+        help='Only regenerate classification_reports.* from an existing output_dir/target_predictions.csv.',
+    )
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
+    if args.report_only:
+        report_only_from_existing_outputs(args.output_dir)
+        return
+    required_args = ['source_dataset', 'target_csv', 'ps_model_ts', 'byte_model_ts']
+    missing_args = [name for name in required_args if getattr(args, name) is None]
+    if missing_args:
+        raise ValueError(f"Missing required arguments for full run: {', '.join(missing_args)}")
 
     ps_model_path, ps_info = load_model_info(args.ps_model_ts)
     byte_model_path, byte_info = load_model_info(args.byte_model_ts)
@@ -551,14 +670,33 @@ def main():
     target_out['pred_avg_idx'] = pred_avg
     target_out['pred_prob_only_idx'] = pred_prob
     target_out['pred_geometry_idx'] = pred_geo
+    target_out['pred_class_oracle_idx'] = y_class_oracle
+    target_out['pred_sample_oracle_idx'] = y_sample_oracle
     target_out['pred_ps'] = [idx2label[i] for i in pred_ps]
     target_out['pred_byte'] = [idx2label[i] for i in pred_byte]
     target_out['pred_avg'] = [idx2label[i] for i in pred_avg]
     target_out['pred_prob_only'] = [idx2label[i] for i in pred_prob]
     target_out['pred_geometry'] = [idx2label[i] for i in pred_geo]
+    target_out['pred_class_oracle'] = [idx2label[i] for i in y_class_oracle]
+    target_out['pred_sample_oracle'] = [idx2label[i] for i in y_sample_oracle]
     for c, label in idx2label.items():
         target_out[f'prob_ps_{label}'] = target_ps['probs'][:, c]
         target_out[f'prob_byte_{label}'] = target_byte['probs'][:, c]
+
+    report_texts, report_dicts, report_df = build_classification_reports(
+        y_target,
+        {
+            'ps': pred_ps,
+            'byte': pred_byte,
+            'avg_prob': pred_avg,
+            'prob_only_class_fusion': pred_prob,
+            'geometry_class_fusion': pred_geo,
+            'class_oracle': y_class_oracle,
+            'sample_oracle': y_sample_oracle,
+        },
+        idx2label,
+        target_known_mask,
+    )
 
     with open(os.path.join(args.output_dir, 'summary.json'), 'w') as f:
         json.dump(summary, f, indent=2)
@@ -566,6 +704,7 @@ def main():
     target_out.to_csv(os.path.join(args.output_dir, 'target_predictions.csv'), index=False)
     write_weights(os.path.join(args.output_dir, 'class_weights_prob.csv'), weights_prob, h_prob, idx2label)
     write_weights(os.path.join(args.output_dir, 'class_weights_geometry.csv'), weights_geo, h_geo, idx2label)
+    write_classification_reports(args.output_dir, report_texts, report_dicts, report_df)
 
     print(json.dumps(summary, indent=2))
 
