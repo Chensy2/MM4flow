@@ -1,7 +1,7 @@
 from datasets import Dataset
 from transformers import BertConfig, BertForMaskedLM, BertTokenizerFast
 from torch import nn
-from sklearn.metrics import accuracy_score, classification_report
+from sklearn.metrics import accuracy_score, classification_report, precision_recall_fscore_support
 from tqdm import tqdm
 import argparse
 import hashlib
@@ -546,6 +546,464 @@ def corr_ignore_nan(a, b):
     return float(np.corrcoef(a[mask], b[mask])[0, 1])
 
 
+def safe_corr_zero(a, b):
+    value = corr_ignore_nan(a, b)
+    return 0.0 if value is None else value
+
+
+def safe_auc(pos, neg):
+    pos = np.asarray(pos, dtype=np.float64)
+    neg = np.asarray(neg, dtype=np.float64)
+    if len(pos) == 0 or len(neg) == 0:
+        return 0.5
+    values = np.concatenate([pos, neg])
+    order = np.argsort(values)
+    ranks = np.empty_like(order, dtype=np.float64)
+    ranks[order] = np.arange(len(values), dtype=np.float64) + 1.0
+    start = 0
+    while start < len(values):
+        end = start + 1
+        while end < len(values) and values[order[end]] == values[order[start]]:
+            end += 1
+        if end - start > 1:
+            ranks[order[start:end]] = np.mean(ranks[order[start:end]])
+        start = end
+    pos_ranks = ranks[:len(pos)]
+    return float((np.sum(pos_ranks) - len(pos) * (len(pos) + 1) / 2.0) / (len(pos) * len(neg)))
+
+
+def effect_size(pos, neg):
+    pos = np.asarray(pos, dtype=np.float64)
+    neg = np.asarray(neg, dtype=np.float64)
+    if len(pos) == 0 or len(neg) == 0:
+        return 0.0
+    pooled = np.sqrt((np.var(pos) + np.var(neg)) / 2.0)
+    if pooled < 1e-12:
+        return 0.0
+    return float((np.mean(pos) - np.mean(neg)) / pooled)
+
+
+def rank_order_desc(values):
+    return [int(idx) for idx in np.argsort(-np.asarray(values, dtype=np.float64))]
+
+
+def rank_matches(a, b):
+    return rank_order_desc(a) == rank_order_desc(b)
+
+
+def top_name(view_names, values):
+    return view_names[int(np.argmax(np.asarray(values, dtype=np.float64)))]
+
+
+def js_divergence(p, q):
+    p = np.asarray(p, dtype=np.float64)
+    q = np.asarray(q, dtype=np.float64)
+    p = p / max(p.sum(), 1e-12)
+    q = q / max(q.sum(), 1e-12)
+    m = 0.5 * (p + q)
+
+    def kl(a, b):
+        mask = a > 0
+        return float(np.sum(a[mask] * np.log((a[mask] + 1e-12) / (b[mask] + 1e-12))))
+
+    return 0.5 * kl(p, m) + 0.5 * kl(q, m)
+
+
+def prediction_distribution_penalty_global(source_labels, pred, num_classes):
+    source_counts = np.bincount(source_labels, minlength=num_classes).astype(np.float64)
+    pred_counts = np.bincount(pred, minlength=num_classes).astype(np.float64)
+    source_prior = source_counts / max(source_counts.sum(), 1.0)
+    pred_prior = pred_counts / max(pred_counts.sum(), 1.0)
+    max_pred_frequency = float(pred_prior.max()) if len(pred_prior) else 0.0
+    max_source_frequency = float(source_prior.max()) if len(source_prior) else 0.0
+    entropy = float(-np.sum(pred_prior[pred_prior > 0] * np.log(pred_prior[pred_prior > 0] + 1e-12)))
+    return {
+        'js': js_divergence(source_prior, pred_prior),
+        'collapse': max(0.0, max_pred_frequency - max_source_frequency),
+        'entropy': entropy,
+        'effective_classes': float(np.exp(entropy)),
+        'max_pred_frequency': max_pred_frequency,
+        'max_source_frequency': max_source_frequency,
+    }
+
+
+def compute_distance_signals(source_features, source_labels, query_features, query_pred, num_classes, var_eps):
+    means, variances = fit_diagonal_gaussians(source_features, source_labels, num_classes, var_eps)
+    distances = mahalanobis_distances(query_features, means, variances)
+    row_idx = np.arange(len(query_pred))
+    pred_dist = distances[row_idx, query_pred]
+    margins = np.zeros(len(query_pred), dtype=np.float64)
+    for i, pred_class in enumerate(query_pred):
+        other = np.delete(distances[i], pred_class)
+        margins[i] = float(np.min(other) - distances[i, pred_class]) if len(other) else 0.0
+    return {
+        'negative_distance': -pred_dist,
+        'distance_to_pred': pred_dist,
+        'geometry_margin': margins,
+    }
+
+
+def compute_softmax_signals(probs):
+    probs = np.asarray(probs, dtype=np.float64)
+    sorted_probs = np.sort(probs, axis=1)
+    top1 = sorted_probs[:, -1]
+    top2 = sorted_probs[:, -2] if probs.shape[1] > 1 else np.zeros_like(top1)
+    entropy = -np.sum(probs * np.log(probs + 1e-12), axis=1)
+    return {
+        'confidence': top1,
+        'softmax_margin': top1 - top2,
+        'negative_entropy': -entropy,
+    }
+
+
+def build_audit_raw_signals(source_outputs, target_outputs, y_source, source_mask, views, num_classes, args):
+    train_raw = {}
+    target_raw = {}
+    source_labels = y_source[source_mask]
+    for view in views:
+        train_pred = source_outputs[view]['pred'].astype(int)
+        target_pred = target_outputs[view]['pred'].astype(int)
+        train_signals = {}
+        target_signals = {}
+        train_signals.update(compute_softmax_signals(source_outputs[view]['probs']))
+        target_signals.update(compute_softmax_signals(target_outputs[view]['probs']))
+        train_signals.update(compute_distance_signals(
+            source_outputs[view]['features'][source_mask],
+            source_labels,
+            source_outputs[view]['features'],
+            train_pred,
+            num_classes,
+            args.var_eps,
+        ))
+        target_signals.update(compute_distance_signals(
+            source_outputs[view]['features'][source_mask],
+            source_labels,
+            target_outputs[view]['features'],
+            target_pred,
+            num_classes,
+            args.var_eps,
+        ))
+        train_raw[view] = train_signals
+        target_raw[view] = target_signals
+    return train_raw, target_raw
+
+
+def source_anchor_components(train_raw, target_raw, views, audit_weights):
+    components = {}
+    for key, weight in audit_weights.items():
+        if abs(float(weight)) < 1e-12:
+            continue
+        train_matrix = np.stack([train_raw[view][key] for view in views], axis=1).astype(np.float32)
+        target_matrix = np.stack([target_raw[view][key] for view in views], axis=1).astype(np.float32)
+        center = np.mean(train_matrix, axis=0, keepdims=True)
+        scale = np.std(train_matrix, axis=0, keepdims=True)
+        components[key] = {
+            'weight': float(weight),
+            'train_z': (train_matrix - center) / np.maximum(scale, 1e-6),
+            'target_z': (target_matrix - center) / np.maximum(scale, 1e-6),
+        }
+    return components
+
+
+def compute_source_anchor_health(components, train_penalties, target_penalties, views, distribution_weights):
+    if components:
+        first = next(iter(components.values()))
+        train_health = np.zeros_like(first['train_z'], dtype=np.float32)
+        target_health = np.zeros_like(first['target_z'], dtype=np.float32)
+    else:
+        train_health = np.zeros((0, len(views)), dtype=np.float32)
+        target_health = np.zeros((0, len(views)), dtype=np.float32)
+
+    for payload in components.values():
+        train_health += payload['weight'] * payload['train_z']
+        target_health += payload['weight'] * payload['target_z']
+
+    train_h = np.mean(train_health, axis=0) if len(train_health) else np.zeros(len(views), dtype=np.float64)
+    target_h = np.mean(target_health, axis=0) if len(target_health) else np.zeros(len(views), dtype=np.float64)
+    train_h_median = np.median(train_health, axis=0) if len(train_health) else np.zeros(len(views), dtype=np.float64)
+    target_h_median = np.median(target_health, axis=0) if len(target_health) else np.zeros(len(views), dtype=np.float64)
+    for idx, view in enumerate(views):
+        train_h[idx] -= distribution_weights['js'] * train_penalties[view]['js']
+        train_h[idx] -= distribution_weights['collapse'] * train_penalties[view]['collapse']
+        target_h[idx] -= distribution_weights['js'] * target_penalties[view]['js']
+        target_h[idx] -= distribution_weights['collapse'] * target_penalties[view]['collapse']
+        train_h_median[idx] -= distribution_weights['js'] * train_penalties[view]['js']
+        train_h_median[idx] -= distribution_weights['collapse'] * train_penalties[view]['collapse']
+        target_h_median[idx] -= distribution_weights['js'] * target_penalties[view]['js']
+        target_h_median[idx] -= distribution_weights['collapse'] * target_penalties[view]['collapse']
+    return train_h, target_h, train_h_median, target_h_median, train_health, target_health
+
+
+def component_rows(views, components, distribution_weights, train_penalties, target_penalties):
+    rows = []
+    for view_idx, view in enumerate(views):
+        train_signal_sum = 0.0
+        target_signal_sum = 0.0
+        for key, payload in sorted(components.items()):
+            train_mean = float(np.mean(payload['train_z'][:, view_idx]))
+            target_mean = float(np.mean(payload['target_z'][:, view_idx]))
+            weighted_train = payload['weight'] * train_mean
+            weighted_target = payload['weight'] * target_mean
+            train_signal_sum += weighted_train
+            target_signal_sum += weighted_target
+            rows.append({
+                'view': view,
+                'component': key,
+                'weight': float(payload['weight']),
+                'train_component_mean': train_mean,
+                'test_component_mean': target_mean,
+                'train_weighted_component': float(weighted_train),
+                'test_weighted_component': float(weighted_target),
+                'shift_train_minus_test': float(weighted_train - weighted_target),
+                'component_type': 'sample_signal',
+            })
+        for component, penalty_key in [('distribution_js_penalty', 'js'), ('collapse_penalty', 'collapse')]:
+            weight = float(distribution_weights[penalty_key])
+            train_value = -weight * float(train_penalties[view][penalty_key])
+            target_value = -weight * float(target_penalties[view][penalty_key])
+            rows.append({
+                'view': view,
+                'component': component,
+                'weight': weight,
+                'train_component_mean': float(train_penalties[view][penalty_key]),
+                'test_component_mean': float(target_penalties[view][penalty_key]),
+                'train_weighted_component': train_value,
+                'test_weighted_component': target_value,
+                'shift_train_minus_test': float(train_value - target_value),
+                'component_type': 'distribution_penalty',
+            })
+        train_total = (
+            train_signal_sum
+            - distribution_weights['js'] * train_penalties[view]['js']
+            - distribution_weights['collapse'] * train_penalties[view]['collapse']
+        )
+        target_total = (
+            target_signal_sum
+            - distribution_weights['js'] * target_penalties[view]['js']
+            - distribution_weights['collapse'] * target_penalties[view]['collapse']
+        )
+        rows.append({
+            'view': view,
+            'component': 'total_source_anchor_H',
+            'weight': 1.0,
+            'train_component_mean': 0.0,
+            'test_component_mean': 0.0,
+            'train_weighted_component': float(train_total),
+            'test_weighted_component': float(target_total),
+            'shift_train_minus_test': float(train_total - target_total),
+            'component_type': 'total',
+        })
+    return rows
+
+
+def correct_wrong_rows(views, y_target, target_known_mask, target_preds, target_raw, target_health, components):
+    rows = []
+    known_idx = np.where(target_known_mask)[0]
+    labels = y_target[known_idx]
+    for view_idx, view in enumerate(views):
+        pred = target_preds[view][known_idx]
+        correct = pred == labels
+        features = {
+            'negative_distance': target_raw[view]['negative_distance'][known_idx],
+            'D_pred': target_raw[view]['distance_to_pred'][known_idx],
+            'geometry_margin': target_raw[view]['geometry_margin'][known_idx],
+            'confidence': target_raw[view]['confidence'][known_idx],
+            'softmax_margin': target_raw[view]['softmax_margin'][known_idx],
+            'negative_entropy': target_raw[view]['negative_entropy'][known_idx],
+            'source_anchored_sample_health': target_health[known_idx, view_idx] if len(target_health) else np.zeros(len(known_idx)),
+        }
+        for key, payload in sorted(components.items()):
+            features[f'source_anchor_component_{key}'] = payload['weight'] * payload['target_z'][known_idx, view_idx]
+        for feature, values in features.items():
+            pos = np.asarray(values[correct], dtype=np.float64)
+            neg = np.asarray(values[~correct], dtype=np.float64)
+            rows.append({
+                'view': view,
+                'feature': feature,
+                'n_correct': int(len(pos)),
+                'n_wrong': int(len(neg)),
+                'mean_correct': float(np.mean(pos)) if len(pos) else 0.0,
+                'mean_wrong': float(np.mean(neg)) if len(neg) else 0.0,
+                'mean_gap_correct_minus_wrong': float(np.mean(pos) - np.mean(neg)) if len(pos) and len(neg) else 0.0,
+                'median_correct': float(np.median(pos)) if len(pos) else 0.0,
+                'median_wrong': float(np.median(neg)) if len(neg) else 0.0,
+                'auc_correct_vs_wrong': safe_auc(pos, neg),
+                'effect_size_correct_vs_wrong': effect_size(pos, neg),
+            })
+    return rows
+
+
+def expert_metrics_by_view(views, y_target, target_known_mask, target_preds):
+    metrics = {'acc': [], 'macro_f1': [], 'weighted_f1': []}
+    y_known = y_target[target_known_mask]
+    for view in views:
+        pred = target_preds[view][target_known_mask]
+        metrics['acc'].append(safe_accuracy(y_target, target_preds[view], target_known_mask) or 0.0)
+        _, _, macro_f1, _ = precision_recall_fscore_support(
+            y_known, pred, average='macro', zero_division=0
+        )
+        _, _, weighted_f1, _ = precision_recall_fscore_support(
+            y_known, pred, average='weighted', zero_division=0
+        )
+        metrics['macro_f1'].append(float(macro_f1))
+        metrics['weighted_f1'].append(float(weighted_f1))
+    return {key: np.asarray(value, dtype=np.float64) for key, value in metrics.items()}
+
+
+def write_health_audit_report(path, rows, rank_summary):
+    with open(path, 'w') as f:
+        f.write('[Health Signal Audit]\n')
+        f.write('If H rank does not match expert metrics, health fusion may amplify the wrong modality.\n\n')
+        f.write('view | acc | macro_f1 | weighted_f1 | H_mean | H_median | W_mean | W_median | JS | collapse | source_train_H | source_test_H | source_shift\n')
+        for row in rows:
+            f.write(
+                '{view} | {expert_acc:.6f} | {expert_macro_f1:.6f} | {expert_weighted_f1:.6f} | '
+                '{H_mean:.6f} | {H_median:.6f} | {weight_from_H_mean_tau1:.6f} | '
+                '{weight_from_H_median_tau1:.6f} | {js:.6f} | {collapse:.6f} | '
+                '{source_anchor_train_H_mean:.6f} | {source_anchor_test_H_mean:.6f} | '
+                '{source_anchor_shift_train_minus_test:.6f}\n'.format(**row)
+            )
+        f.write('\n[Rank Summary]\n')
+        for key in sorted(rank_summary.keys()):
+            f.write(f'{key}: {rank_summary[key]}\n')
+
+
+def write_health_audit(
+    output_dir, views, y_source, source_mask, y_target, target_known_mask,
+    source_outputs, target_outputs, target_preds, num_classes,
+    h_prob, h_geo, weights_prob, weights_geo, recall_by_view,
+    target_supports, class_best_view, prob_selected, geo_selected, args
+):
+    audit_weights = {
+        'geometry_margin': args.w_audit_geometry_margin,
+        'negative_distance': args.w_audit_negative_distance,
+        'softmax_margin': args.w_audit_softmax_margin,
+        'negative_entropy': args.w_audit_negative_entropy,
+        'confidence': args.w_audit_confidence,
+    }
+    distribution_weights = {
+        'js': args.w_audit_distribution_shift,
+        'collapse': args.w_audit_prediction_collapse,
+    }
+    train_raw, target_raw = build_audit_raw_signals(
+        source_outputs, target_outputs, y_source, source_mask, views, num_classes, args
+    )
+    source_labels = y_source[source_mask]
+    train_penalties = {
+        view: prediction_distribution_penalty_global(source_labels, source_outputs[view]['pred'].astype(int), num_classes)
+        for view in views
+    }
+    target_penalties = {
+        view: prediction_distribution_penalty_global(source_labels, target_preds[view], num_classes)
+        for view in views
+    }
+    components = source_anchor_components(train_raw, target_raw, views, audit_weights)
+    train_h, target_h, train_h_median, target_h_median, train_health, target_health = compute_source_anchor_health(
+        components, train_penalties, target_penalties, views, distribution_weights
+    )
+    weights_mean = softmax_np(target_h[None, :], axis=1)[0]
+    weights_median = softmax_np(target_h_median[None, :], axis=1)[0]
+    expert = expert_metrics_by_view(views, y_target, target_known_mask, target_preds)
+
+    signal_rows = []
+    for idx, view in enumerate(views):
+        row = {
+            'view': view,
+            'expert_acc': float(expert['acc'][idx]),
+            'expert_macro_f1': float(expert['macro_f1'][idx]),
+            'expert_weighted_f1': float(expert['weighted_f1'][idx]),
+            'd_pred_mean': float(np.mean(target_raw[view]['negative_distance'])),
+            'd_pred_median': float(np.median(target_raw[view]['negative_distance'])),
+            'd_pred_std': float(np.std(target_raw[view]['negative_distance'])),
+            'margin_mean': float(np.mean(target_raw[view]['geometry_margin'])),
+            'margin_median': float(np.median(target_raw[view]['geometry_margin'])),
+            'margin_std': float(np.std(target_raw[view]['geometry_margin'])),
+            'negative_distance_mean': float(np.mean(target_raw[view]['negative_distance'])),
+            'negative_distance_median': float(np.median(target_raw[view]['negative_distance'])),
+            'raw_health_mean': float(np.mean(target_health[:, idx])) if len(target_health) else 0.0,
+            'raw_health_median': float(np.median(target_health[:, idx])) if len(target_health) else 0.0,
+            'js': float(target_penalties[view]['js']),
+            'collapse': float(target_penalties[view]['collapse']),
+            'pred_entropy': float(target_penalties[view]['entropy']),
+            'effective_pred_classes': float(target_penalties[view]['effective_classes']),
+            'pred_dist_js_to_source': float(target_penalties[view]['js']),
+            'max_pred_frequency': float(target_penalties[view]['max_pred_frequency']),
+            'H_mean': float(target_h[idx]),
+            'H_median': float(target_h_median[idx]),
+            'weight_from_H_mean_tau1': float(weights_mean[idx]),
+            'weight_from_H_median_tau1': float(weights_median[idx]),
+            'source_anchor_train_H_mean': float(train_h[idx]),
+            'source_anchor_test_H_mean': float(target_h[idx]),
+            'source_anchor_shift_train_minus_test': float(train_h[idx] - target_h[idx]),
+        }
+        signal_rows.append(row)
+
+    rank_summary = {
+        'top_expert_view_acc': top_name(views, expert['acc']),
+        'top_expert_view_macro_f1': top_name(views, expert['macro_f1']),
+        'top_expert_view_weighted_f1': top_name(views, expert['weighted_f1']),
+        'top_H_mean_view': top_name(views, target_h),
+        'top_H_median_view': top_name(views, target_h_median),
+        'H_mean_rank_matches_acc_rank': bool(rank_matches(target_h, expert['acc'])),
+        'H_mean_rank_matches_macro_f1_rank': bool(rank_matches(target_h, expert['macro_f1'])),
+        'H_mean_rank_matches_weighted_f1_rank': bool(rank_matches(target_h, expert['weighted_f1'])),
+        'H_median_rank_matches_acc_rank': bool(rank_matches(target_h_median, expert['acc'])),
+        'H_median_rank_matches_macro_f1_rank': bool(rank_matches(target_h_median, expert['macro_f1'])),
+        'H_median_rank_matches_weighted_f1_rank': bool(rank_matches(target_h_median, expert['weighted_f1'])),
+        'corr_H_mean_expert_acc': safe_corr_zero(target_h, expert['acc']),
+        'corr_H_mean_expert_macro_f1': safe_corr_zero(target_h, expert['macro_f1']),
+        'corr_H_mean_expert_weighted_f1': safe_corr_zero(target_h, expert['weighted_f1']),
+        'corr_H_median_expert_acc': safe_corr_zero(target_h_median, expert['acc']),
+        'corr_H_median_expert_macro_f1': safe_corr_zero(target_h_median, expert['macro_f1']),
+        'corr_H_median_expert_weighted_f1': safe_corr_zero(target_h_median, expert['weighted_f1']),
+        'health_gap_mean': float(np.sort(target_h)[-1] - np.sort(target_h)[-2]) if len(target_h) > 1 else 0.0,
+        'health_gap_median': float(np.sort(target_h_median)[-1] - np.sort(target_h_median)[-2]) if len(target_h_median) > 1 else 0.0,
+        'expert_acc_by_view': {view: float(expert['acc'][idx]) for idx, view in enumerate(views)},
+        'expert_macro_f1_by_view': {view: float(expert['macro_f1'][idx]) for idx, view in enumerate(views)},
+        'expert_weighted_f1_by_view': {view: float(expert['weighted_f1'][idx]) for idx, view in enumerate(views)},
+        'H_mean_by_view': {view: float(target_h[idx]) for idx, view in enumerate(views)},
+        'H_median_by_view': {view: float(target_h_median[idx]) for idx, view in enumerate(views)},
+        'weight_from_H_mean_tau1_by_view': {view: float(weights_mean[idx]) for idx, view in enumerate(views)},
+        'weight_from_H_median_tau1_by_view': {view: float(weights_median[idx]) for idx, view in enumerate(views)},
+    }
+
+    class_rows = []
+    for c in range(num_classes):
+        row = {
+            'class_idx': c,
+            'support': int(target_supports[c]),
+            'best_recall_view': class_best_view[c],
+            'prob_selected_view': prob_selected[c],
+            'geo_selected_view': geo_selected[c],
+        }
+        for view in views:
+            row[f'{view}_recall'] = recall_by_view[view][c]
+        for idx, view in enumerate(views):
+            row[f'H_prob_{view}'] = h_prob[idx, c]
+            row[f'W_prob_{view}'] = weights_prob[idx, c]
+            row[f'H_geo_{view}'] = h_geo[idx, c]
+            row[f'W_geo_{view}'] = weights_geo[idx, c]
+        class_rows.append(row)
+
+    rank_summary.update({
+        'class_prob_best_view_match_rate': float((prob_selected == class_best_view).mean()),
+        'class_geo_best_view_match_rate': float((geo_selected == class_best_view).mean()),
+    })
+
+    correct_wrong = correct_wrong_rows(
+        views, y_target, target_known_mask, target_preds, target_raw, target_health, components
+    )
+    components_summary = component_rows(views, components, distribution_weights, train_penalties, target_penalties)
+
+    pd.DataFrame(signal_rows).to_csv(os.path.join(output_dir, 'health_audit_signal_summary.csv'), index=False)
+    pd.DataFrame(components_summary).to_csv(os.path.join(output_dir, 'health_audit_component_summary.csv'), index=False)
+    pd.DataFrame(correct_wrong).to_csv(os.path.join(output_dir, 'health_audit_correct_wrong_summary.csv'), index=False)
+    pd.DataFrame(class_rows).to_csv(os.path.join(output_dir, 'health_audit_class_summary.csv'), index=False)
+    with open(os.path.join(output_dir, 'health_audit_rank_summary.json'), 'w') as f:
+        json.dump(rank_summary, f, indent=2, sort_keys=True)
+    write_health_audit_report(os.path.join(output_dir, 'health_audit_signal_report.txt'), signal_rows, rank_summary)
+
+
 def write_weights(path, weights, h_values, idx2label, views):
     rows = []
     for c, label in idx2label.items():
@@ -667,6 +1125,15 @@ def main():
     parser.add_argument('--views', default='ps,byte')
     parser.add_argument('--cache_dir', default=None)
     parser.add_argument('--overwrite_cache', action='store_true')
+    parser.add_argument('--audit_only', action='store_true')
+    parser.add_argument('--write_health_audit', action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument('--w_audit_geometry_margin', type=float, default=1.0)
+    parser.add_argument('--w_audit_negative_distance', type=float, default=1.0)
+    parser.add_argument('--w_audit_softmax_margin', type=float, default=0.0)
+    parser.add_argument('--w_audit_negative_entropy', type=float, default=0.0)
+    parser.add_argument('--w_audit_confidence', type=float, default=0.0)
+    parser.add_argument('--w_audit_distribution_shift', type=float, default=1.0)
+    parser.add_argument('--w_audit_prediction_collapse', type=float, default=1.0)
     parser.add_argument('--output_dir', required=True)
     parser.add_argument('--batch_size', '-b', type=int, default=64)
     parser.add_argument('--tau', type=float, default=1.0)
@@ -752,6 +1219,16 @@ def main():
             source_outputs[view] = source_cached
             target_outputs[view] = target_cached
             continue
+        if args.audit_only:
+            missing = []
+            if source_cached is None:
+                missing.append(f'source_{view}.npz')
+            if target_cached is None:
+                missing.append(f'target_{view}.npz')
+            cache_dir = args.cache_dir or os.path.join(args.output_dir, 'cache')
+            raise FileNotFoundError(
+                f"--audit_only requires existing matching cache files in {cache_dir}; missing or stale: {', '.join(missing)}"
+            )
 
         model = load_view_model(model_paths[view], model_infos[view], view, num_classes)
         source_outputs[view] = get_outputs_with_cache(
@@ -904,6 +1381,13 @@ def main():
     write_weights(os.path.join(args.output_dir, 'class_weights_prob.csv'), weights_prob, h_prob, idx2label, views)
     write_weights(os.path.join(args.output_dir, 'class_weights_geometry.csv'), weights_geo, h_geo, idx2label, views)
     write_classification_reports(args.output_dir, report_texts, report_dicts, report_df)
+    if args.write_health_audit:
+        write_health_audit(
+            args.output_dir, views, y_source, source_mask, y_target, target_known_mask,
+            source_outputs, target_outputs, target_preds, num_classes,
+            h_prob, h_geo, weights_prob, weights_geo, recall_by_view,
+            target_supports, class_best_view, prob_selected, geo_selected, args
+        )
 
     print(json.dumps(summary, indent=2))
 
