@@ -535,6 +535,53 @@ def fuse_probs(weights, probs_by_view, views):
     return fused
 
 
+def top2_gap(values):
+    values = np.asarray(values, dtype=np.float64)
+    if len(values) < 2:
+        return 1.0
+    sorted_values = np.sort(values)
+    return float(sorted_values[-1] - sorted_values[-2])
+
+
+def agreement_gated_weights(weights_prob, weights_geo, fallback='prob', margin=0.1):
+    if weights_prob.shape != weights_geo.shape:
+        raise ValueError(f"weights_prob and weights_geo shapes differ: {weights_prob.shape} vs {weights_geo.shape}")
+
+    num_views, num_classes = weights_prob.shape
+    weights = np.zeros_like(weights_prob, dtype=np.float64)
+    decisions = []
+    for c in range(num_classes):
+        top_prob = int(np.argmax(weights_prob[:, c]))
+        top_geo = int(np.argmax(weights_geo[:, c]))
+        sharp_prob = top2_gap(weights_prob[:, c])
+        sharp_geo = top2_gap(weights_geo[:, c])
+
+        if top_prob == top_geo:
+            combined = weights_prob[:, c] * weights_geo[:, c]
+            weights[:, c] = combined / max(combined.sum(), 1e-12)
+            decisions.append('agree_product')
+        elif fallback == 'uniform':
+            weights[:, c] = np.ones(num_views, dtype=np.float64) / max(num_views, 1)
+            decisions.append('conflict_uniform')
+        elif fallback == 'sharper':
+            if sharp_geo > sharp_prob + margin:
+                weights[:, c] = weights_geo[:, c]
+                decisions.append('conflict_geo_sharper')
+            else:
+                weights[:, c] = weights_prob[:, c]
+                decisions.append('conflict_prob_sharper_or_default')
+        elif fallback == 'average':
+            weights[:, c] = 0.5 * (weights_prob[:, c] + weights_geo[:, c])
+            weights[:, c] = weights[:, c] / max(weights[:, c].sum(), 1e-12)
+            decisions.append('conflict_average')
+        elif fallback == 'prob':
+            weights[:, c] = weights_prob[:, c]
+            decisions.append('conflict_prob_fallback')
+        else:
+            raise ValueError(f"Unsupported agreement gate fallback: {fallback}")
+    return weights, np.array(decisions, dtype=object)
+
+
 def corr_ignore_nan(a, b):
     a = np.asarray(a, dtype=np.float64)
     b = np.asarray(b, dtype=np.float64)
@@ -1017,6 +1064,20 @@ def write_weights(path, weights, h_values, idx2label, views):
     pd.DataFrame(rows).to_csv(path, index=False)
 
 
+def write_agreement_weights(path, weights, h_prob, h_geo, decisions, idx2label, views):
+    rows = []
+    for c, label in idx2label.items():
+        row = {'class_idx': c, 'label': label}
+        for i, view in enumerate(views):
+            row[f'H_prob_{view}'] = h_prob[i, c]
+            row[f'H_geo_{view}'] = h_geo[i, c]
+            row[f'W_agreement_{view}'] = weights[i, c]
+        row['selected_view'] = views[int(np.argmax(weights[:, c]))]
+        row['agreement_gate_decision'] = decisions[c]
+        rows.append(row)
+    pd.DataFrame(rows).to_csv(path, index=False)
+
+
 def build_classification_reports(y_true, predictions, idx2label, known_mask):
     labels = list(idx2label.keys())
     target_names = [idx2label[i] for i in labels]
@@ -1091,6 +1152,7 @@ def report_only_from_existing_outputs(output_dir):
         'avg': 'avg_prob',
         'prob_only': 'prob_only_class_fusion',
         'geometry': 'geometry_class_fusion',
+        'agreement_gated': 'agreement_gated_class_fusion',
     }
     for column in target_out.columns:
         if column.startswith('pred_') and column.endswith('_idx'):
@@ -1125,6 +1187,8 @@ def main():
     parser.add_argument('--views', default='ps,byte')
     parser.add_argument('--cache_dir', default=None)
     parser.add_argument('--overwrite_cache', action='store_true')
+    parser.add_argument('--agreement_gate_fallback', choices=['prob', 'uniform', 'sharper', 'average'], default='prob')
+    parser.add_argument('--agreement_gate_margin', type=float, default=0.1)
     parser.add_argument('--audit_only', action='store_true')
     parser.add_argument('--write_health_audit', action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument('--w_audit_geometry_margin', type=float, default=1.0)
@@ -1277,10 +1341,21 @@ def main():
     probs_geo = fuse_probs(weights_geo, target_probs, views)
     pred_geo = probs_geo.argmax(axis=1)
 
+    weights_agreement, agreement_decisions = agreement_gated_weights(
+        weights_prob,
+        weights_geo,
+        fallback=args.agreement_gate_fallback,
+        margin=args.agreement_gate_margin,
+    )
+    probs_agreement = fuse_probs(weights_agreement, target_probs, views)
+    pred_agreement = probs_agreement.argmax(axis=1)
+
     prob_selected = np.array([views[i] for i in weights_prob.argmax(axis=0)], dtype=object)
     geo_selected = np.array([views[i] for i in weights_geo.argmax(axis=0)], dtype=object)
+    agreement_selected = np.array([views[i] for i in weights_agreement.argmax(axis=0)], dtype=object)
     health_best_view_match_rate_prob = float((prob_selected == class_best_view).mean())
     health_best_view_match_rate_geo = float((geo_selected == class_best_view).mean())
+    health_best_view_match_rate_agreement = float((agreement_selected == class_best_view).mean())
 
     per_rows = []
     for c, label in idx2label.items():
@@ -1302,6 +1377,10 @@ def main():
         for i, view in enumerate(views):
             row[f'W_geo_{view}'] = weights_geo[i, c]
         row['geo_selected_view'] = geo_selected[c]
+        for i, view in enumerate(views):
+            row[f'W_agreement_{view}'] = weights_agreement[i, c]
+        row['agreement_selected_view'] = agreement_selected[c]
+        row['agreement_gate_decision'] = agreement_decisions[c]
         per_rows.append(row)
     per_class_df = pd.DataFrame(per_rows)
 
@@ -1317,6 +1396,8 @@ def main():
         'views': views,
         'model_ts_by_view': model_ts_by_view,
         'cache_dir': args.cache_dir or os.path.join(args.output_dir, 'cache'),
+        'agreement_gate_fallback': args.agreement_gate_fallback,
+        'agreement_gate_margin': args.agreement_gate_margin,
         'num_classes': num_classes,
         'num_source_samples': int(source_len),
         'num_target_samples': int(target_len),
@@ -1326,10 +1407,15 @@ def main():
         'avg_prob_acc': safe_accuracy(y_target, pred_avg, target_known_mask),
         'prob_only_class_fusion_acc': safe_accuracy(y_target, pred_prob, target_known_mask),
         'geometry_class_fusion_acc': safe_accuracy(y_target, pred_geo, target_known_mask),
+        'agreement_gated_class_fusion_acc': safe_accuracy(y_target, pred_agreement, target_known_mask),
         'class_oracle_acc': safe_accuracy(y_target, y_class_oracle, target_known_mask),
         'sample_oracle_acc': safe_accuracy(y_target, y_sample_oracle, target_known_mask),
         'health_best_view_match_rate_prob': health_best_view_match_rate_prob,
         'health_best_view_match_rate_geo': health_best_view_match_rate_geo,
+        'health_best_view_match_rate_agreement': health_best_view_match_rate_agreement,
+        'agreement_gate_decision_counts': {
+            str(name): int((agreement_decisions == name).sum()) for name in sorted(set(agreement_decisions))
+        },
         'corr_h_prob_selected_with_best_recall': corr_ignore_nan(h_prob_best, best_recall),
         'corr_h_geo_selected_with_best_recall': corr_ignore_nan(h_geo_best, best_recall),
         'warnings': [],
@@ -1346,6 +1432,7 @@ def main():
     target_out['pred_avg_idx'] = pred_avg
     target_out['pred_prob_only_idx'] = pred_prob
     target_out['pred_geometry_idx'] = pred_geo
+    target_out['pred_agreement_gated_idx'] = pred_agreement
     target_out['pred_class_oracle_idx'] = y_class_oracle
     target_out['pred_sample_oracle_idx'] = y_sample_oracle
     for view in views:
@@ -1353,6 +1440,7 @@ def main():
     target_out['pred_avg'] = [idx2label[i] for i in pred_avg]
     target_out['pred_prob_only'] = [idx2label[i] for i in pred_prob]
     target_out['pred_geometry'] = [idx2label[i] for i in pred_geo]
+    target_out['pred_agreement_gated'] = [idx2label[i] for i in pred_agreement]
     target_out['pred_class_oracle'] = [idx2label[i] for i in y_class_oracle]
     target_out['pred_sample_oracle'] = [idx2label[i] for i in y_sample_oracle]
     for view in views:
@@ -1364,6 +1452,7 @@ def main():
         'avg_prob': pred_avg,
         'prob_only_class_fusion': pred_prob,
         'geometry_class_fusion': pred_geo,
+        'agreement_gated_class_fusion': pred_agreement,
         'class_oracle': y_class_oracle,
         'sample_oracle': y_sample_oracle,
     })
@@ -1380,6 +1469,10 @@ def main():
     target_out.to_csv(os.path.join(args.output_dir, 'target_predictions.csv'), index=False)
     write_weights(os.path.join(args.output_dir, 'class_weights_prob.csv'), weights_prob, h_prob, idx2label, views)
     write_weights(os.path.join(args.output_dir, 'class_weights_geometry.csv'), weights_geo, h_geo, idx2label, views)
+    write_agreement_weights(
+        os.path.join(args.output_dir, 'class_weights_agreement_gated.csv'),
+        weights_agreement, h_prob, h_geo, agreement_decisions, idx2label, views
+    )
     write_classification_reports(args.output_dir, report_texts, report_dicts, report_df)
     if args.write_health_audit:
         write_health_audit(
