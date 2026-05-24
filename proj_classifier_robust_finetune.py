@@ -372,7 +372,7 @@ def train_robust_head(
             beta = torch.zeros_like(z)
 
         sigma2 = sigma2_by_class[y].clamp_min(1e-12)
-        gamma = torch.normal(mean=0.0, std=torch.sqrt(sigma2), size=z.shape, device=device)
+        gamma = torch.normal(mean=torch.zeros_like(z), std=torch.sqrt(sigma2))
         z_e = alpha * z + beta + gamma
 
         logits_clean = head(z)
