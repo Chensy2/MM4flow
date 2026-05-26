@@ -1794,13 +1794,13 @@ def main():
     report_predictions = {view: target_preds[view] for view in views}
     report_predictions.update({
         'avg_prob': pred_avg,
-          'prob_only_class_fusion': pred_prob,
-          'geometry_class_fusion': pred_geo,
-          'agreement_gated_class_fusion': pred_agreement,
-          'hspf': pred_hspf,
-          'class_oracle': y_class_oracle,
-          'sample_oracle': y_sample_oracle,
-      })
+        'prob_only_class_fusion': pred_prob,
+        'geometry_class_fusion': pred_geo,
+        'agreement_gated_class_fusion': pred_agreement,
+        'hspf': pred_hspf,
+        'class_oracle': y_class_oracle,
+        'sample_oracle': y_sample_oracle,
+    })
     report_texts, report_dicts, report_df = build_classification_reports(
         y_target,
         report_predictions,
