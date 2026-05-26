@@ -333,8 +333,18 @@ def ensure_dir(path):
 
 
 def _l2_normalize(x, eps=1e-12):
+    x = np.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
     norm = np.linalg.norm(x, axis=1, keepdims=True)
     return x / np.maximum(norm, eps)
+
+
+def assert_finite_array(name, arr):
+    arr_np = np.asarray(arr)
+    finite = np.isfinite(arr_np)
+    if not np.all(finite):
+        bad = int(arr_np.size - np.sum(finite))
+        total = int(arr_np.size)
+        raise ValueError(f"[CCT] Non-finite values in {name}: {bad}/{total}. Check feature extraction/cache.")
 
 
 def pairwise_distance_min_to_protos(query, protos, metric):
@@ -357,6 +367,8 @@ def pairwise_distance_min_to_protos(query, protos, metric):
 
 
 def point_to_center_distance(points, center, metric):
+    assert_finite_array("point_to_center_distance.points", points)
+    assert_finite_array("point_to_center_distance.center", center)
     if metric == "euclidean":
         return np.linalg.norm(points - center[None, :], axis=1)
     pn = _l2_normalize(points.astype(np.float64))
@@ -464,6 +476,7 @@ def dpmeans_class(features, metric, dp_lambda, dp_percentile, min_proto_mass, ma
 
 
 def kmeans_target(features, K, metric, max_iter=50, seed=42):
+    assert_finite_array("target_features_for_kmeans", features)
     # Prefer sklearn if available.
     try:
         from sklearn.cluster import KMeans  # type: ignore
@@ -535,12 +548,17 @@ def softmax_np(x, axis=-1):
 
 
 def compute_alignment(target_centers, target_masses, source_protos_by_class, metric, tau):
+    assert_finite_array("target_cluster_centers", target_centers)
+    assert_finite_array("target_cluster_masses", target_masses)
     C = len(source_protos_by_class)
     K = target_centers.shape[0]
     dist = np.zeros((K, C), dtype=np.float32)
     for c in range(C):
+        assert_finite_array(f"source_prototypes_class_{c}", source_protos_by_class[c])
         dist[:, c] = pairwise_distance_min_to_protos(target_centers, source_protos_by_class[c], metric)
+    assert_finite_array("cluster_class_distance", dist)
     A = softmax_np(-dist / max(1e-12, float(tau)), axis=1).astype(np.float32)
+    assert_finite_array("cluster_class_assignment", A)
     ent = -np.sum(A * np.log(A + 1e-12), axis=1)
     # class-wise mass and mu_target
     mass_c = (A * target_masses[:, None]).sum(axis=0)  # [C]
@@ -829,6 +847,9 @@ def main():
         val_np = val_features
         val_y = val_labels
         target_np = target_features.numpy().astype(np.float32)
+        assert_finite_array(f"{view}.source_train_features", train_np)
+        assert_finite_array(f"{view}.source_val_features", val_features.numpy())
+        assert_finite_array(f"{view}.target_features", target_np)
 
         # Step 2: class-wise DPMeans
         source_protos_by_class = []
