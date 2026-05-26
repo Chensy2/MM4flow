@@ -560,6 +560,44 @@ def evaluate_head(head, features, labels):
     return {"acc": acc, "weighted_f1": float(f1), "weighted_precision": float(p), "weighted_recall": float(r)}
 
 
+def evaluate_head_probs(head, features, labels=None, report_topk=3):
+    head.eval()
+    with torch.no_grad():
+        logits = head(features.to(device))
+        probs = torch.softmax(logits, dim=1).detach().cpu().numpy()
+        preds = np.argmax(probs, axis=1).astype(np.int64)
+    out = {"preds": preds, "probs": probs}
+    if labels is None:
+        return out
+    y_true = labels.detach().cpu().numpy().astype(np.int64)
+    out["acc"] = float(accuracy_score(y_true, preds))
+    p, r, f1, _ = precision_recall_fscore_support(y_true, preds, average="weighted", zero_division=0)
+    out["weighted_f1"] = float(f1)
+    out["weighted_precision"] = float(p)
+    out["weighted_recall"] = float(r)
+    if report_topk and report_topk >= 2:
+        topk = min(int(report_topk), probs.shape[1])
+        top_idx = np.argsort(-probs, axis=1)[:, :topk]
+        y_col = y_true.reshape(-1, 1)
+        if topk >= 2:
+            out["top2"] = float(np.mean(np.any(top_idx[:, :2] == y_col, axis=1)))
+        if topk >= 3:
+            out["top3"] = float(np.mean(np.any(top_idx[:, :3] == y_col, axis=1)))
+    return out
+
+
+def probs_entropy(probs):
+    p = np.asarray(probs, dtype=np.float64)
+    return -np.sum(p * np.log(p + 1e-12), axis=1)
+
+
+def pred_distribution(preds, num_classes):
+    preds = np.asarray(preds, dtype=np.int64)
+    counts = np.bincount(preds, minlength=num_classes).astype(np.int64)
+    fracs = counts.astype(np.float64) / max(1, preds.shape[0])
+    return counts, fracs
+
+
 def train_cct_head(
     head,
     train_features,
@@ -656,6 +694,10 @@ def main():
     parser.add_argument("--cct_distance", choices=["cosine", "euclidean"], default="cosine")
     parser.add_argument("--cct_min_proto_mass", type=int, default=2)
 
+    parser.add_argument("--report_topk", type=int, default=3)
+    parser.add_argument("--eval_target_after_train", action="store_true")
+    parser.add_argument("--save_target_pred_csv", action="store_true")
+
     parser.add_argument("--reuse_feature_cache_dir", default=None)
     parser.add_argument("--save_feature_cache_dir", default=None)
     parser.add_argument("--max_train_features", type=int, default=None)
@@ -712,6 +754,9 @@ def main():
         "cct_dp_percentile": args.cct_dp_percentile,
         "cct_distance": args.cct_distance,
         "cct_min_proto_mass": args.cct_min_proto_mass,
+        "report_topk": int(args.report_topk),
+        "eval_target_after_train": bool(args.eval_target_after_train),
+        "save_target_pred_csv": bool(args.save_target_pred_csv),
         "output_suffix": args.output_suffix,
         "reuse_feature_cache_dir": args.reuse_feature_cache_dir,
         "save_feature_cache_dir": args.save_feature_cache_dir,
@@ -761,6 +806,17 @@ def main():
             val_labels = val_labels[: args.max_val_features]
         if args.max_target_features is not None and target_features.shape[0] > args.max_target_features:
             target_features = target_features[: args.max_target_features]
+
+        # If target has labels, use ONLY for diagnostics (never for training/selection).
+        target_has_label = "label" in df_target_all.columns
+        target_labels = None
+        if target_has_label:
+            df_label = df_target_all[df_target_all["label"].isin(label2idx.keys())].copy()
+            if len(df_label) > 0:
+                target_labels = torch.from_numpy(df_label["label"].map(label2idx).astype(np.int64).values)
+            else:
+                target_has_label = False
+                target_labels = None
 
         train_np = train_features.numpy().astype(np.float32)
         y_np = train_labels.numpy().astype(np.int64)
@@ -842,6 +898,7 @@ def main():
         for p in head.parameters():
             p.requires_grad_(True)
 
+        base_head_state = copy.deepcopy({k: v.detach().cpu().clone() for k, v in head.state_dict().items()})
         delta_torch = torch.from_numpy(delta)
         base_val_weighted_f1, best = train_cct_head(
             head,
@@ -859,6 +916,98 @@ def main():
             anchor_weight=args.anchor_weight,
             cct_shift_rho=args.cct_shift_rho,
         )
+
+        # Target diagnostics: base vs robust (for analysis only; no target labels used in training/selection).
+        base_target_metrics = None
+        robust_target_metrics = None
+        counts_csv_path = None
+        pred_csv_path = None
+        stats_path = None
+        if args.eval_target_after_train:
+            base_head = copy.deepcopy(head).to(device)
+            base_head.load_state_dict(base_head_state, strict=True)
+            robust_head = head.to(device)
+
+            base_eval = evaluate_head_probs(base_head, target_features, target_labels if target_has_label else None, report_topk=args.report_topk)
+            robust_eval = evaluate_head_probs(robust_head, target_features, target_labels if target_has_label else None, report_topk=args.report_topk)
+            base_probs = base_eval["probs"]
+            robust_probs = robust_eval["probs"]
+            base_preds = base_eval["preds"]
+            robust_preds = robust_eval["preds"]
+
+            ent_base = probs_entropy(base_probs)
+            ent_robust = probs_entropy(robust_probs)
+            base_counts, base_fracs = pred_distribution(base_preds, num_classes)
+            robust_counts, robust_fracs = pred_distribution(robust_preds, num_classes)
+
+            if target_has_label:
+                base_target_metrics = {k: base_eval.get(k) for k in ["acc", "weighted_f1", "top2", "top3"] if k in base_eval}
+                robust_target_metrics = {k: robust_eval.get(k) for k in ["acc", "weighted_f1", "top2", "top3"] if k in robust_eval}
+
+            pred_stats = {
+                "view": view,
+                "num_samples": int(target_features.shape[0]),
+                "target_has_label": bool(target_has_label),
+                "base_target_metrics": base_target_metrics,
+                "robust_target_metrics": robust_target_metrics,
+                "prediction_entropy_before_after": {
+                    "base": {
+                        "mean_entropy": float(np.mean(ent_base)),
+                        "median_entropy": float(np.median(ent_base)),
+                        "p10_entropy": float(np.percentile(ent_base, 10)),
+                        "p90_entropy": float(np.percentile(ent_base, 90)),
+                    },
+                    "robust": {
+                        "mean_entropy": float(np.mean(ent_robust)),
+                        "median_entropy": float(np.median(ent_robust)),
+                        "p10_entropy": float(np.percentile(ent_robust, 10)),
+                        "p90_entropy": float(np.percentile(ent_robust, 90)),
+                    },
+                },
+                "prediction_count_by_class_before_after": {
+                    "base_count": {idx2label[i]: int(base_counts[i]) for i in range(num_classes)},
+                    "robust_count": {idx2label[i]: int(robust_counts[i]) for i in range(num_classes)},
+                    "base_frac": {idx2label[i]: float(base_fracs[i]) for i in range(num_classes)},
+                    "robust_frac": {idx2label[i]: float(robust_fracs[i]) for i in range(num_classes)},
+                },
+            }
+            stats_path = os.path.join(args.output_dir, f"target_pred_stats_{view}.json")
+            with open(stats_path, "w") as f:
+                json.dump(pred_stats, f, indent=2, sort_keys=True)
+
+            rows = []
+            for i in range(num_classes):
+                rows.append(
+                    {
+                        "class": idx2label[i],
+                        "base_count": int(base_counts[i]),
+                        "robust_count": int(robust_counts[i]),
+                        "base_frac": float(base_fracs[i]),
+                        "robust_frac": float(robust_fracs[i]),
+                    }
+                )
+            counts_csv_path = os.path.join(args.output_dir, f"target_pred_counts_{view}.csv")
+            pd.DataFrame(rows).to_csv(counts_csv_path, index=False)
+
+            if args.save_target_pred_csv:
+                df_out = pd.DataFrame(
+                    {
+                        "pred_base_idx": base_preds,
+                        "pred_robust_idx": robust_preds,
+                        "entropy_base": ent_base,
+                        "entropy_robust": ent_robust,
+                        "maxprob_base": np.max(base_probs, axis=1),
+                        "maxprob_robust": np.max(robust_probs, axis=1),
+                    }
+                )
+                df_out["pred_base"] = [idx2label[int(i)] for i in df_out["pred_base_idx"].values]
+                df_out["pred_robust"] = [idx2label[int(i)] for i in df_out["pred_robust_idx"].values]
+                if target_has_label and target_labels is not None:
+                    y_true = target_labels.detach().cpu().numpy()
+                    df_out["y_label"] = y_true
+                    df_out["label"] = [idx2label[int(i)] for i in y_true]
+                pred_csv_path = os.path.join(args.output_dir, f"target_predictions_{view}_base_vs_robust.csv.gz")
+                df_out.to_csv(pred_csv_path, index=False, compression="gzip")
 
         # diagnostics save
         view_prefix = os.path.join(args.output_dir, f"cct_{view}")
@@ -888,6 +1037,17 @@ def main():
             "base_val_weighted_f1": float(base_val_weighted_f1),
             "best_step": int(best["step"]),
             "best_val_weighted_f1": float(best["metrics"]["weighted_f1"]) if best["metrics"] else 0.0,
+            "base_target_acc": None if not (target_has_label and base_target_metrics) else base_target_metrics.get("acc"),
+            "robust_target_acc": None if not (target_has_label and robust_target_metrics) else robust_target_metrics.get("acc"),
+            "base_target_weighted_f1": None if not (target_has_label and base_target_metrics) else base_target_metrics.get("weighted_f1"),
+            "robust_target_weighted_f1": None if not (target_has_label and robust_target_metrics) else robust_target_metrics.get("weighted_f1"),
+            "base_top2": None if not (target_has_label and base_target_metrics) else base_target_metrics.get("top2"),
+            "robust_top2": None if not (target_has_label and robust_target_metrics) else robust_target_metrics.get("top2"),
+            "base_top3": None if not (target_has_label and base_target_metrics) else base_target_metrics.get("top3"),
+            "robust_top3": None if not (target_has_label and robust_target_metrics) else robust_target_metrics.get("top3"),
+            "target_pred_stats_path": stats_path,
+            "target_pred_counts_path": counts_csv_path,
+            "target_pred_csv_path": pred_csv_path,
         }
         with open(os.path.join(args.output_dir, f"cct_summary_{view}.json"), "w") as f:
             json.dump(cct_summary_view, f, indent=2, sort_keys=True)
@@ -930,6 +1090,14 @@ def main():
             "assignment_entropy_max": cct_summary_view["assignment_entropy_max"],
             "best_step": int(best["step"]),
             "best_val_weighted_f1": float(best["metrics"]["weighted_f1"]) if best["metrics"] else 0.0,
+            "base_target_acc": cct_summary_view["base_target_acc"],
+            "robust_target_acc": cct_summary_view["robust_target_acc"],
+            "base_target_weighted_f1": cct_summary_view["base_target_weighted_f1"],
+            "robust_target_weighted_f1": cct_summary_view["robust_target_weighted_f1"],
+            "base_top2": cct_summary_view["base_top2"],
+            "robust_top2": cct_summary_view["robust_top2"],
+            "base_top3": cct_summary_view["base_top3"],
+            "robust_top3": cct_summary_view["robust_top3"],
             "diagnostic_output_dir": args.output_dir,
             "cct_summary_path": os.path.join(args.output_dir, f"cct_summary_{view}.json"),
             "cct_delta_path": view_prefix + "_delta.npy",
@@ -939,6 +1107,9 @@ def main():
             "cct_source_prototypes_path": view_prefix + "_source_prototypes.npy",
             "cct_source_prototype_class_ids_path": view_prefix + "_source_prototype_class_ids.npy",
             "cct_source_prototype_masses_path": view_prefix + "_source_prototype_masses.npy",
+            "target_pred_stats_path": stats_path,
+            "target_pred_counts_path": counts_csv_path,
+            "target_pred_csv_path": pred_csv_path,
         }
         with open(os.path.join(new_root, "info.json"), "w") as f:
             json.dump(robust_info, f, indent=2, sort_keys=True)
@@ -970,4 +1141,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
