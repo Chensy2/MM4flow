@@ -535,6 +535,275 @@ def fuse_probs(weights, probs_by_view, views):
     return fused
 
 
+def entropy_rows(probs):
+    probs = np.asarray(probs, dtype=np.float64)
+    return -np.sum(probs * np.log(probs + 1e-12), axis=1)
+
+
+def entropy_dist(dist):
+    dist = np.asarray(dist, dtype=np.float64)
+    dist = dist / max(float(dist.sum()), 1e-12)
+    return float(-np.sum(dist * np.log(dist + 1e-12)))
+
+
+def js_divergence(p, q):
+    p = np.asarray(p, dtype=np.float64)
+    q = np.asarray(q, dtype=np.float64)
+    p = p / max(float(p.sum()), 1e-12)
+    q = q / max(float(q.sum()), 1e-12)
+    m = 0.5 * (p + q)
+    return float(0.5 * (
+        np.sum(p * (np.log(p + 1e-12) - np.log(m + 1e-12))) +
+        np.sum(q * (np.log(q + 1e-12) - np.log(m + 1e-12)))
+    ))
+
+
+def kl_divergence(p, q):
+    p = np.asarray(p, dtype=np.float64)
+    q = np.asarray(q, dtype=np.float64)
+    p = p / max(float(p.sum()), 1e-12)
+    q = q / max(float(q.sum()), 1e-12)
+    return float(np.sum(p * (np.log(p + 1e-12) - np.log(q + 1e-12))))
+
+
+def pred_frequency(pred, num_classes):
+    counts = np.bincount(np.asarray(pred, dtype=int), minlength=num_classes).astype(np.float64)
+    return counts / max(float(counts.sum()), 1e-12)
+
+
+def rank_likelihood(values, higher_better=False, power=1.0):
+    values = np.asarray(values, dtype=np.float64)
+    finite = np.where(np.isfinite(values), values, -np.inf if higher_better else np.inf)
+    order = np.argsort(-finite if higher_better else finite, kind='mergesort')
+    ranks = np.empty(len(values), dtype=np.float64)
+    ranks[order] = np.arange(1, len(values) + 1, dtype=np.float64)
+    likelihood = (len(values) + 1.0 - ranks) / max(float(len(values)), 1.0)
+    return np.power(likelihood, power)
+
+
+def margin_mean(probs):
+    probs = np.asarray(probs, dtype=np.float64)
+    if probs.shape[1] < 2:
+        return float(np.mean(probs[:, 0]))
+    part = np.partition(probs, -2, axis=1)
+    return float(np.mean(part[:, -1] - part[:, -2]))
+
+
+def hspf_make_subset_key(subset):
+    return '+'.join(subset)
+
+
+def hspf_candidate_name(subset, rule):
+    return f"{hspf_make_subset_key(subset)}__{rule}"
+
+
+def hspf_fuse_subset(subset, rule, probs_by_view, weights_prob, weights_geo, weights_agreement, views):
+    subset = list(subset)
+    if rule == 'identity':
+        return probs_by_view[subset[0]]
+    if rule == 'average':
+        return np.mean([probs_by_view[view] for view in subset], axis=0)
+    view_indices = [views.index(view) for view in subset]
+    if rule == 'prob_class':
+        weights = weights_prob[view_indices, :]
+    elif rule == 'geometry_class':
+        weights = weights_geo[view_indices, :]
+    elif rule == 'agreement_gate':
+        weights = weights_agreement[view_indices, :]
+    else:
+        raise ValueError(f"Unsupported HSPF rule: {rule}")
+    weights = weights / np.maximum(weights.sum(axis=0, keepdims=True), 1e-12)
+    fused = np.zeros_like(probs_by_view[subset[0]], dtype=np.float64)
+    for i, view in enumerate(subset):
+        fused += weights[i][None, :] * probs_by_view[view]
+    return fused / np.maximum(fused.sum(axis=1, keepdims=True), 1e-12)
+
+
+def hspf_build_candidates(views, probs_by_view, weights_prob, weights_geo, weights_agreement):
+    from itertools import combinations
+
+    candidates = []
+    for view in views:
+        candidates.append({
+            'name': hspf_candidate_name([view], 'identity'),
+            'subset': (view,),
+            'rule': 'identity',
+            'probs': probs_by_view[view],
+        })
+    for size in range(2, len(views) + 1):
+        for subset in combinations(views, size):
+            for rule in ['average', 'prob_class', 'geometry_class', 'agreement_gate']:
+                candidates.append({
+                    'name': hspf_candidate_name(subset, rule),
+                    'subset': tuple(subset),
+                    'rule': rule,
+                    'probs': hspf_fuse_subset(subset, rule, probs_by_view, weights_prob, weights_geo, weights_agreement, views),
+                })
+    return candidates
+
+
+def hspf_weighted_identity_base(subset, probs_by_view, view_gate):
+    weights = np.array([view_gate[view] for view in subset], dtype=np.float64)
+    weights = weights / max(float(weights.sum()), 1e-12)
+    base = np.zeros_like(probs_by_view[subset[0]], dtype=np.float64)
+    for weight, view in zip(weights, subset):
+        base += weight * probs_by_view[view]
+    return base / np.maximum(base.sum(axis=1, keepdims=True), 1e-12)
+
+
+def hspf_source_scores(candidates, source_val_probs_by_view, source_val_labels, source_val_mask,
+                       weights_prob, weights_geo, weights_agreement, views):
+    scores = {}
+    for cand in candidates:
+        probs = hspf_fuse_subset(
+            cand['subset'], cand['rule'], source_val_probs_by_view,
+            weights_prob, weights_geo, weights_agreement, views
+        )
+        pred = probs.argmax(axis=1)
+        if source_val_mask.sum() == 0:
+            scores[cand['name']] = 0.0
+            continue
+        _, _, f1, _ = precision_recall_fscore_support(
+            source_val_labels[source_val_mask],
+            pred[source_val_mask],
+            average='weighted',
+            zero_division=0,
+        )
+        scores[cand['name']] = float(f1)
+    return scores
+
+
+def hspf_view_gate(views, source_outputs, target_outputs, num_classes, source_prior):
+    evidence = {view: {} for view in views}
+    for view in views:
+        src_prob_mean = np.mean(source_outputs[view]['probs'], axis=0)
+        tgt_prob_mean = np.mean(target_outputs[view]['probs'], axis=0)
+        src_pred_freq = pred_frequency(source_outputs[view]['pred'], num_classes)
+        tgt_pred_freq = pred_frequency(target_outputs[view]['pred'], num_classes)
+        evidence[view]['prior_penalty'] = kl_divergence(tgt_prob_mean, source_prior)
+        evidence[view]['source_target_pred_freq_js'] = js_divergence(src_pred_freq, tgt_pred_freq)
+        evidence[view]['source_target_mean_prob_js'] = js_divergence(src_prob_mean, tgt_prob_mean)
+        evidence[view]['collapse_penalty'] = float(np.max(tgt_pred_freq))
+        evidence[view]['target_prediction_diversity_risk'] = 1.0 - entropy_dist(tgt_pred_freq) / max(np.log(num_classes), 1e-12)
+
+    strengths = np.ones(len(views), dtype=np.float64)
+    for metric in [
+        'prior_penalty',
+        'source_target_pred_freq_js',
+        'source_target_mean_prob_js',
+        'collapse_penalty',
+        'target_prediction_diversity_risk',
+    ]:
+        values = np.array([evidence[view][metric] for view in views], dtype=np.float64)
+        strengths *= rank_likelihood(values, higher_better=False)
+    strengths = strengths / max(float(strengths.sum()), 1e-12)
+    return {view: float(strengths[i]) for i, view in enumerate(views)}, evidence
+
+
+def hspf_run(candidates, views, target_probs_by_view, source_outputs, target_outputs, source_prior,
+             source_val_probs_by_view, source_val_labels, source_val_mask,
+             weights_prob, weights_geo, weights_agreement, num_classes):
+    view_gate, view_evidence = hspf_view_gate(views, source_outputs, target_outputs, num_classes, source_prior)
+    source_scores = hspf_source_scores(
+        candidates, source_val_probs_by_view, source_val_labels, source_val_mask,
+        weights_prob, weights_geo, weights_agreement, views
+    )
+
+    subset_g, bal_risk, im_scores, harms, src_scores = [], [], [], [], []
+    for cand in candidates:
+        probs = cand['probs']
+        subset = cand['subset']
+        subset_gate = np.array([view_gate[view] for view in subset], dtype=np.float64)
+        subset_g.append(float(np.prod(np.maximum(subset_gate, 1e-12)) ** (1.0 / len(subset))))
+        mean_prob = np.mean(probs, axis=0)
+        bal_risk.append(js_divergence(mean_prob, source_prior))
+        im_scores.append(entropy_dist(mean_prob) - float(np.mean(entropy_rows(probs))))
+        src_scores.append(source_scores[cand['name']])
+        if cand['rule'] == 'identity':
+            harms.append(0.0)
+        else:
+            base = hspf_weighted_identity_base(subset, target_probs_by_view, view_gate)
+            ent_delta = max(float(np.mean(entropy_rows(probs)) - np.mean(entropy_rows(base))), 0.0)
+            margin_delta = max(margin_mean(base) - margin_mean(probs), 0.0)
+            flip = float(np.mean((probs.argmax(axis=1) != base.argmax(axis=1)) * np.max(base, axis=1)))
+            balance_delta = max(js_divergence(mean_prob, source_prior) - js_divergence(np.mean(base, axis=0), source_prior), 0.0)
+            harms.append(ent_delta + margin_delta + flip + balance_delta)
+
+    subset_g = np.asarray(subset_g, dtype=np.float64)
+    bal_risk = np.asarray(bal_risk, dtype=np.float64)
+    im_scores = np.asarray(im_scores, dtype=np.float64)
+    harms = np.asarray(harms, dtype=np.float64)
+    src_scores = np.asarray(src_scores, dtype=np.float64)
+
+    L_view = rank_likelihood(subset_g, higher_better=True, power=0.5)
+    L_bal = rank_likelihood(bal_risk, higher_better=False)
+    L_im = rank_likelihood(im_scores, higher_better=True)
+    L_src = rank_likelihood(src_scores, higher_better=True, power=0.3)
+    L_harm = rank_likelihood(harms, higher_better=False, power=2.0)
+    L_c = L_bal * L_im * L_src * L_harm
+
+    rules = ['identity', 'average', 'prob_class', 'geometry_class', 'agreement_gate']
+    rule_scores = {}
+    for rule in rules:
+        values = np.array([L_c[i] for i, cand in enumerate(candidates) if cand['rule'] == rule], dtype=np.float64)
+        if len(values) == 0:
+            rule_scores[rule] = 0.0
+        else:
+            sorted_values = np.sort(values)[::-1]
+            top_n = max(1, int(np.ceil(len(sorted_values) / 2.0)))
+            rule_scores[rule] = float(np.mean(sorted_values[:top_n]))
+    rule_total = sum(rule_scores.values())
+    rule_prior = (
+        {rule: 1.0 / len(rules) for rule in rules}
+        if rule_total <= 0 else
+        {rule: float(score / rule_total) for rule, score in rule_scores.items()}
+    )
+
+    L_rule = np.array([rule_prior[cand['rule']] ** 0.5 for cand in candidates], dtype=np.float64)
+    posterior_raw = L_view * L_rule * L_c
+    posterior = posterior_raw / max(float(posterior_raw.sum()), 1e-12)
+    if not np.isfinite(posterior).all() or posterior.sum() <= 0:
+        posterior = np.ones(len(candidates), dtype=np.float64) / len(candidates)
+
+    final_probs = np.zeros_like(candidates[0]['probs'], dtype=np.float64)
+    for weight, cand in zip(posterior, candidates):
+        final_probs += weight * cand['probs']
+    final_probs = final_probs / np.maximum(final_probs.sum(axis=1, keepdims=True), 1e-12)
+
+    rows = []
+    for rank, idx in enumerate(np.argsort(-posterior), start=1):
+        cand = candidates[idx]
+        rows.append({
+            'rank': rank,
+            'candidate': cand['name'],
+            'subset': hspf_make_subset_key(cand['subset']),
+            'rule': cand['rule'],
+            'posterior': float(posterior[idx]),
+            'L_view': float(L_view[idx]),
+            'L_rule': float(L_rule[idx]),
+            'L_bal': float(L_bal[idx]),
+            'L_im': float(L_im[idx]),
+            'L_src': float(L_src[idx]),
+            'L_harm': float(L_harm[idx]),
+            'balance_risk': float(bal_risk[idx]),
+            'information_maximization': float(im_scores[idx]),
+            'source_val_weighted_f1': float(src_scores[idx]),
+            'harm': float(harms[idx]),
+            'subset_gate_geomean': float(subset_g[idx]),
+        })
+
+    return {
+        'pred': final_probs.argmax(axis=1),
+        'probs': final_probs,
+        'posterior': posterior,
+        'candidate_rows': rows,
+        'view_gate': view_gate,
+        'view_evidence': view_evidence,
+        'rule_prior': rule_prior,
+        'posterior_entropy_norm': entropy_dist(posterior) / max(np.log(len(candidates)), 1e-12),
+    }
+
+
 def top2_gap(values):
     values = np.asarray(values, dtype=np.float64)
     if len(values) < 2:
@@ -1239,54 +1508,73 @@ def main():
     num_classes = len(label2idx)
 
     source_df = pd.read_csv(os.path.join(args.source_dataset, 'train.csv.gz'), compression='gzip', index_col=0)
+    source_val_path = os.path.join(args.source_dataset, 'val.csv.gz')
+    if not os.path.exists(source_val_path):
+        raise FileNotFoundError(f"HSPF source prior requires validation split: {source_val_path}")
+    source_val_df = pd.read_csv(source_val_path, compression='gzip', index_col=0)
     target_df = pd.read_csv(args.target_csv, compression='gzip', index_col=0)
     if args.max_source_samples is not None:
         source_df = source_df.head(args.max_source_samples)
+        source_val_df = source_val_df.head(args.max_source_samples)
     if args.max_target_samples is not None:
         target_df = target_df.head(args.max_target_samples)
 
     source_view_dfs = {view: preprocess_dataframe(source_df, view, label2idx) for view in views}
+    source_val_view_dfs = {view: preprocess_dataframe(source_val_df, view, label2idx) for view in views}
     target_view_dfs = {view: preprocess_dataframe(target_df, view, label2idx) for view in views}
 
     source_len = len(source_view_dfs[views[0]])
+    source_val_len = len(source_val_view_dfs[views[0]])
     target_len = len(target_view_dfs[views[0]])
     for view in views[1:]:
         if len(source_view_dfs[view]) != source_len:
             raise ValueError(f"Source sample mismatch after preprocessing: {views[0]}={source_len}, {view}={len(source_view_dfs[view])}")
+        if len(source_val_view_dfs[view]) != source_val_len:
+            raise ValueError(f"Source val sample mismatch after preprocessing: {views[0]}={source_val_len}, {view}={len(source_val_view_dfs[view])}")
         if len(target_view_dfs[view]) != target_len:
             raise ValueError(f"Target sample mismatch after preprocessing: {views[0]}={target_len}, {view}={len(target_view_dfs[view])}")
 
     source_mask = source_view_dfs[views[0]]['y_label'].notna().to_numpy()
+    source_val_mask = source_val_view_dfs[views[0]]['y_label'].notna().to_numpy()
     target_known_mask = (
         target_view_dfs[views[0]]['y_label'].notna().to_numpy()
         if 'y_label' in target_view_dfs[views[0]].columns
         else np.zeros(target_len, dtype=bool)
     )
     y_source = source_view_dfs[views[0]]['y_label'].fillna(-1).astype(int).to_numpy()
+    y_source_val = source_val_view_dfs[views[0]]['y_label'].fillna(-1).astype(int).to_numpy()
     y_target = target_view_dfs[views[0]]['y_label'].fillna(-1).astype(int).to_numpy()
 
     source_datasets = {view: make_dataset(source_view_dfs[view], view, has_label=True) for view in views}
+    source_val_datasets = {view: make_dataset(source_val_view_dfs[view], view, has_label=True) for view in views}
     target_has_label = 'label' in target_view_dfs[views[0]].columns
     target_datasets = {view: make_dataset(target_view_dfs[view], view, has_label=target_has_label) for view in views}
 
-    source_outputs, target_outputs = {}, {}
+    source_outputs, source_val_outputs, target_outputs = {}, {}, {}
     for view in views:
         source_cached = try_load_outputs_from_cache(
             'source', view, args.source_dataset, model_ts_by_view[view],
             num_classes, label2idx, source_datasets[view].num_rows, args
         )
+        source_val_cached = try_load_outputs_from_cache(
+            'source_val', view, source_val_path, model_ts_by_view[view],
+            num_classes, label2idx, source_val_datasets[view].num_rows, args
+        )
         target_cached = try_load_outputs_from_cache(
             'target', view, args.target_csv, model_ts_by_view[view],
             num_classes, label2idx, target_datasets[view].num_rows, args
         )
-        if source_cached is not None and target_cached is not None:
+        if source_cached is not None and source_val_cached is not None and target_cached is not None:
             source_outputs[view] = source_cached
+            source_val_outputs[view] = source_val_cached
             target_outputs[view] = target_cached
             continue
         if args.audit_only:
             missing = []
             if source_cached is None:
                 missing.append(f'source_{view}.npz')
+            if source_val_cached is None:
+                missing.append(f'source_val_{view}.npz')
             if target_cached is None:
                 missing.append(f'target_{view}.npz')
             cache_dir = args.cache_dir or os.path.join(args.output_dir, 'cache')
@@ -1295,11 +1583,15 @@ def main():
             )
 
         model = load_view_model(model_paths[view], model_infos[view], view, num_classes)
-        source_outputs[view] = get_outputs_with_cache(
+        source_outputs[view] = source_cached or get_outputs_with_cache(
             model, source_datasets[view], 'source', view, args.source_dataset,
             model_ts_by_view[view], num_classes, label2idx, args
         )
-        target_outputs[view] = get_outputs_with_cache(
+        source_val_outputs[view] = source_val_cached or get_outputs_with_cache(
+            model, source_val_datasets[view], 'source_val', view, source_val_path,
+            model_ts_by_view[view], num_classes, label2idx, args
+        )
+        target_outputs[view] = target_cached or get_outputs_with_cache(
             model, target_datasets[view], 'target', view, args.target_csv,
             model_ts_by_view[view], num_classes, label2idx, args
         )
@@ -1349,6 +1641,31 @@ def main():
     )
     probs_agreement = fuse_probs(weights_agreement, target_probs, views)
     pred_agreement = probs_agreement.argmax(axis=1)
+
+    source_val_probs = {view: source_val_outputs[view]['probs'] for view in views}
+    hspf_candidates = hspf_build_candidates(
+        views,
+        target_probs,
+        weights_prob,
+        weights_geo,
+        weights_agreement,
+    )
+    hspf = hspf_run(
+        hspf_candidates,
+        views,
+        target_probs,
+        source_outputs,
+        target_outputs,
+        src_prior,
+        source_val_probs,
+        y_source_val,
+        source_val_mask,
+        weights_prob,
+        weights_geo,
+        weights_agreement,
+        num_classes,
+    )
+    pred_hspf = hspf['pred']
 
     prob_selected = np.array([views[i] for i in weights_prob.argmax(axis=0)], dtype=object)
     geo_selected = np.array([views[i] for i in weights_geo.argmax(axis=0)], dtype=object)
@@ -1400,6 +1717,7 @@ def main():
         'agreement_gate_margin': args.agreement_gate_margin,
         'num_classes': num_classes,
         'num_source_samples': int(source_len),
+        'num_source_val_samples': int(source_val_len),
         'num_target_samples': int(target_len),
         'num_target_known_label_samples': int(target_known_mask.sum()),
         **acc_by_view,
@@ -1408,6 +1726,12 @@ def main():
         'prob_only_class_fusion_acc': safe_accuracy(y_target, pred_prob, target_known_mask),
         'geometry_class_fusion_acc': safe_accuracy(y_target, pred_geo, target_known_mask),
         'agreement_gated_class_fusion_acc': safe_accuracy(y_target, pred_agreement, target_known_mask),
+        'hspf_acc_diagnostic': safe_accuracy(y_target, pred_hspf, target_known_mask),
+        'hspf_top_candidate': hspf['candidate_rows'][0]['candidate'] if hspf['candidate_rows'] else None,
+        'hspf_top_posterior': hspf['candidate_rows'][0]['posterior'] if hspf['candidate_rows'] else None,
+        'hspf_entropy_norm': hspf['posterior_entropy_norm'],
+        'hspf_view_gate': hspf['view_gate'],
+        'hspf_rule_prior': hspf['rule_prior'],
         'class_oracle_acc': safe_accuracy(y_target, y_class_oracle, target_known_mask),
         'sample_oracle_acc': safe_accuracy(y_target, y_sample_oracle, target_known_mask),
         'health_best_view_match_rate_prob': health_best_view_match_rate_prob,
@@ -1424,6 +1748,24 @@ def main():
         summary['warnings'].append('sample_oracle_acc is lower than best_single_acc; check labels/predictions.')
     if summary['class_oracle_acc'] is not None and summary['class_oracle_acc'] + 1e-12 < summary['best_single_acc']:
         summary['warnings'].append('class_oracle_acc is lower than best_single_acc; this may happen if target has missing classes.')
+    if target_known_mask.sum() > 0:
+        _, _, hspf_weighted_f1, _ = precision_recall_fscore_support(
+            y_target[target_known_mask], pred_hspf[target_known_mask], average='weighted', zero_division=0
+        )
+        _, _, hspf_macro_f1, _ = precision_recall_fscore_support(
+            y_target[target_known_mask], pred_hspf[target_known_mask], average='macro', zero_division=0
+        )
+        summary['hspf_weighted_f1'] = float(hspf_weighted_f1)
+        summary['hspf_macro_f1_diagnostic'] = float(hspf_macro_f1)
+        summary['primary_portfolio_weighted_f1'] = float(hspf_weighted_f1)
+        summary['primary_portfolio_acc_diagnostic'] = summary['hspf_acc_diagnostic']
+        summary['primary_portfolio_macro_f1_diagnostic'] = float(hspf_macro_f1)
+    else:
+        summary['hspf_weighted_f1'] = None
+        summary['hspf_macro_f1_diagnostic'] = None
+        summary['primary_portfolio_weighted_f1'] = None
+        summary['primary_portfolio_acc_diagnostic'] = None
+        summary['primary_portfolio_macro_f1_diagnostic'] = None
 
     target_out = target_view_dfs[views[0]].copy()
     target_out['y_true_idx'] = y_target
@@ -1433,6 +1775,7 @@ def main():
     target_out['pred_prob_only_idx'] = pred_prob
     target_out['pred_geometry_idx'] = pred_geo
     target_out['pred_agreement_gated_idx'] = pred_agreement
+    target_out['pred_hspf_idx'] = pred_hspf
     target_out['pred_class_oracle_idx'] = y_class_oracle
     target_out['pred_sample_oracle_idx'] = y_sample_oracle
     for view in views:
@@ -1441,6 +1784,7 @@ def main():
     target_out['pred_prob_only'] = [idx2label[i] for i in pred_prob]
     target_out['pred_geometry'] = [idx2label[i] for i in pred_geo]
     target_out['pred_agreement_gated'] = [idx2label[i] for i in pred_agreement]
+    target_out['pred_hspf'] = [idx2label[i] for i in pred_hspf]
     target_out['pred_class_oracle'] = [idx2label[i] for i in y_class_oracle]
     target_out['pred_sample_oracle'] = [idx2label[i] for i in y_sample_oracle]
     for view in views:
@@ -1450,12 +1794,13 @@ def main():
     report_predictions = {view: target_preds[view] for view in views}
     report_predictions.update({
         'avg_prob': pred_avg,
-        'prob_only_class_fusion': pred_prob,
-        'geometry_class_fusion': pred_geo,
-        'agreement_gated_class_fusion': pred_agreement,
-        'class_oracle': y_class_oracle,
-        'sample_oracle': y_sample_oracle,
-    })
+          'prob_only_class_fusion': pred_prob,
+          'geometry_class_fusion': pred_geo,
+          'agreement_gated_class_fusion': pred_agreement,
+          'hspf': pred_hspf,
+          'class_oracle': y_class_oracle,
+          'sample_oracle': y_sample_oracle,
+      })
     report_texts, report_dicts, report_df = build_classification_reports(
         y_target,
         report_predictions,
@@ -1467,6 +1812,17 @@ def main():
         json.dump(summary, f, indent=2)
     per_class_df.to_csv(os.path.join(args.output_dir, 'per_class_metrics.csv'), index=False)
     target_out.to_csv(os.path.join(args.output_dir, 'target_predictions.csv'), index=False)
+    pd.DataFrame(hspf['candidate_rows']).to_csv(os.path.join(args.output_dir, 'hspf_candidate_ranking.csv'), index=False)
+    hspf_view_rows = []
+    for view in views:
+        row = {'view': view, 'gate': hspf['view_gate'][view]}
+        row.update(hspf['view_evidence'][view])
+        hspf_view_rows.append(row)
+    pd.DataFrame(hspf_view_rows).to_csv(os.path.join(args.output_dir, 'hspf_view_gates.csv'), index=False)
+    pd.DataFrame([
+        {'rule': rule, 'prior': prior}
+        for rule, prior in hspf['rule_prior'].items()
+    ]).to_csv(os.path.join(args.output_dir, 'hspf_rule_priors.csv'), index=False)
     write_weights(os.path.join(args.output_dir, 'class_weights_prob.csv'), weights_prob, h_prob, idx2label, views)
     write_weights(os.path.join(args.output_dir, 'class_weights_geometry.csv'), weights_geo, h_geo, idx2label, views)
     write_agreement_weights(

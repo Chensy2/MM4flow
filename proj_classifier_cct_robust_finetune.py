@@ -819,7 +819,13 @@ def main():
                 target_labels = None
 
         train_np = train_features.numpy().astype(np.float32)
-        y_np = train_labels.numpy().astype(np.int64)
+        y_np = train_labels.numpy()
+        if y_np.ndim != 1:
+            y_np = y_np.reshape(-1)
+        if np.any(pd.isna(y_np)):
+            bad = int(np.sum(pd.isna(y_np)))
+            raise ValueError(f"[CCT] Found {bad} NaN labels in source_train for view={view}. Check label2idx mapping.")
+        y_np = y_np.astype(np.int64)
         val_np = val_features
         val_y = val_labels
         target_np = target_features.numpy().astype(np.float32)
@@ -833,16 +839,18 @@ def main():
         proto_masses_pack = []
         dp_lams = []
 
+        empty_classes = []
         for c in tqdm(range(num_classes), desc=f"dpmeans[{view}]", unit="class"):
             idx = np.where(y_np == c)[0]
-            feats_c = train_np[idx]
-            if feats_c.shape[0] == 0:
+            if idx.size == 0:
+                empty_classes.append(int(c))
                 # Fallback: zeros
                 mu_c = np.zeros((train_np.shape[1],), dtype=np.float32)
                 protos_c = mu_c[None, :]
                 masses_c = np.array([0], dtype=np.int64)
                 lam_c = 1e-6
             else:
+                feats_c = train_np[idx]
                 mu_c = np.mean(feats_c, axis=0).astype(np.float32)
                 protos_c, masses_c, _, lam_c = dpmeans_class(
                     feats_c,
@@ -1027,6 +1035,7 @@ def main():
             "feature_dim": int(train_np.shape[1]),
             "num_classes": num_classes,
             "target_cluster_count": int(K),
+            "empty_source_classes": empty_classes,
             "dp_lambda_by_class": dp_lams,
             "source_proto_count_by_class": source_proto_counts,
             "source_proto_count_min": int(source_proto_counts_arr.min()) if source_proto_counts_arr.size else 0,
