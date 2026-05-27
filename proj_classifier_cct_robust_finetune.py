@@ -468,9 +468,22 @@ def dpmeans_class(features, metric, dp_lambda, dp_percentile, min_proto_mass, ma
             new_protos = []
             for k in range(len(large)):
                 idx = np.where(assign == k)[0]
+                if len(idx) == 0:
+                    continue
                 new_protos.append(np.mean(features[idx], axis=0).astype(np.float32))
-            proto_arr = np.stack(new_protos, axis=0)
-            masses = np.bincount(assign, minlength=proto_arr.shape[0]).astype(np.int64)
+            if not new_protos:
+                proto_arr = center.astype(np.float32)[None, :]
+                masses = np.array([features.shape[0]], dtype=np.int64)
+            else:
+                proto_arr = np.stack(new_protos, axis=0)
+                if metric == "euclidean":
+                    dists = np.linalg.norm(features[:, None, :] - proto_arr[None, :, :], axis=2)
+                else:
+                    fn = _l2_normalize(features.astype(np.float64))
+                    pn = _l2_normalize(proto_arr.astype(np.float64))
+                    dists = 1.0 - (fn @ pn.T)
+                assign = np.argmin(dists, axis=1).astype(np.int64)
+                masses = np.bincount(assign, minlength=proto_arr.shape[0]).astype(np.int64)
 
     return proto_arr.astype(np.float32), masses.astype(np.int64), assign.astype(np.int64), lam
 
