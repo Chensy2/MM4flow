@@ -583,10 +583,66 @@ def rank_likelihood(values, higher_better=False, power=1.0):
 
 def margin_mean(probs):
     probs = np.asarray(probs, dtype=np.float64)
+    if probs.shape[0] == 0:
+        return 0.0
     if probs.shape[1] < 2:
         return float(np.mean(probs[:, 0]))
     part = np.partition(probs, -2, axis=1)
     return float(np.mean(part[:, -1] - part[:, -2]))
+
+
+def mean_confidence(probs):
+    probs = np.asarray(probs, dtype=np.float64)
+    if probs.shape[0] == 0:
+        return 0.0
+    return float(np.mean(np.max(probs, axis=1)))
+
+
+def mean_entropy(probs):
+    probs = np.asarray(probs, dtype=np.float64)
+    if probs.shape[0] == 0:
+        return 0.0
+    return float(np.mean(entropy_rows(probs)))
+
+
+def weighted_f1_or_none(y_true, pred, known_mask):
+    if known_mask.sum() == 0:
+        return None
+    _, _, f1, _ = precision_recall_fscore_support(
+        y_true[known_mask],
+        pred[known_mask],
+        average='weighted',
+        zero_division=0,
+    )
+    return float(f1)
+
+
+def average_ranks(values, higher_better=True):
+    values = np.asarray(values, dtype=np.float64)
+    finite = np.where(np.isfinite(values), values, -np.inf if higher_better else np.inf)
+    order = np.argsort(-finite if higher_better else finite, kind='mergesort')
+    ranks = np.empty(len(values), dtype=np.float64)
+    start = 0
+    while start < len(values):
+        end = start + 1
+        while end < len(values) and finite[order[end]] == finite[order[start]]:
+            end += 1
+        ranks[order[start:end]] = 0.5 * (start + 1 + end)
+        start = end
+    return ranks
+
+
+def spearman_corr(x, y):
+    x = np.asarray(x, dtype=np.float64)
+    y = np.asarray(y, dtype=np.float64)
+    mask = np.isfinite(x) & np.isfinite(y)
+    if mask.sum() < 2:
+        return 0.0
+    rx = average_ranks(x[mask], higher_better=True)
+    ry = average_ranks(y[mask], higher_better=True)
+    if np.std(rx) < 1e-12 or np.std(ry) < 1e-12:
+        return 0.0
+    return float(np.corrcoef(rx, ry)[0, 1])
 
 
 def hspf_make_subset_key(subset):
@@ -710,6 +766,7 @@ def hspf_run(candidates, views, target_probs_by_view, source_outputs, target_out
     )
 
     subset_g, bal_risk, im_scores, harms, src_scores = [], [], [], [], []
+    harm_entropy, harm_margin, harm_flip, harm_balance = [], [], [], []
     for cand in candidates:
         probs = cand['probs']
         subset = cand['subset']
@@ -721,6 +778,10 @@ def hspf_run(candidates, views, target_probs_by_view, source_outputs, target_out
         src_scores.append(source_scores[cand['name']])
         if cand['rule'] == 'identity':
             harms.append(0.0)
+            harm_entropy.append(0.0)
+            harm_margin.append(0.0)
+            harm_flip.append(0.0)
+            harm_balance.append(0.0)
         else:
             base = hspf_weighted_identity_base(subset, target_probs_by_view, view_gate)
             ent_delta = max(float(np.mean(entropy_rows(probs)) - np.mean(entropy_rows(base))), 0.0)
@@ -728,19 +789,28 @@ def hspf_run(candidates, views, target_probs_by_view, source_outputs, target_out
             flip = float(np.mean((probs.argmax(axis=1) != base.argmax(axis=1)) * np.max(base, axis=1)))
             balance_delta = max(js_divergence(mean_prob, source_prior) - js_divergence(np.mean(base, axis=0), source_prior), 0.0)
             harms.append(ent_delta + margin_delta + flip + balance_delta)
+            harm_entropy.append(ent_delta)
+            harm_margin.append(margin_delta)
+            harm_flip.append(flip)
+            harm_balance.append(balance_delta)
 
     subset_g = np.asarray(subset_g, dtype=np.float64)
     bal_risk = np.asarray(bal_risk, dtype=np.float64)
     im_scores = np.asarray(im_scores, dtype=np.float64)
     harms = np.asarray(harms, dtype=np.float64)
     src_scores = np.asarray(src_scores, dtype=np.float64)
+    harm_entropy = np.asarray(harm_entropy, dtype=np.float64)
+    harm_margin = np.asarray(harm_margin, dtype=np.float64)
+    harm_flip = np.asarray(harm_flip, dtype=np.float64)
+    harm_balance = np.asarray(harm_balance, dtype=np.float64)
 
     L_view = rank_likelihood(subset_g, higher_better=True, power=0.5)
     L_bal = rank_likelihood(bal_risk, higher_better=False)
     L_im = rank_likelihood(im_scores, higher_better=True)
     L_src = rank_likelihood(src_scores, higher_better=True, power=0.3)
     L_harm = rank_likelihood(harms, higher_better=False, power=2.0)
-    L_c = L_bal * L_im * L_src * L_harm
+    L_health = L_bal * L_im * L_src
+    L_c = L_health * L_harm
 
     rules = ['identity', 'average', 'prob_class', 'geometry_class', 'agreement_gate']
     rule_scores = {}
@@ -792,16 +862,242 @@ def hspf_run(candidates, views, target_probs_by_view, source_outputs, target_out
             'subset_gate_geomean': float(subset_g[idx]),
         })
 
+    evidence_rows = []
+    for idx, cand in enumerate(candidates):
+        evidence_rows.append({
+            'candidate_id': idx,
+            'candidate': cand['name'],
+            'view_subset': hspf_make_subset_key(cand['subset']),
+            'fusion_rule': cand['rule'],
+            'class_balance_risk': float(bal_risk[idx]),
+            'target_im_score': float(im_scores[idx]),
+            'source_score': float(src_scores[idx]),
+            'self_harm_penalty': float(harms[idx]),
+            'self_harm_entropy': float(harm_entropy[idx]),
+            'self_harm_margin': float(harm_margin[idx]),
+            'self_harm_flip': float(harm_flip[idx]),
+            'self_harm_balance': float(harm_balance[idx]),
+            'hspf_balance_likelihood': float(L_bal[idx]),
+            'hspf_im_likelihood': float(L_im[idx]),
+            'hspf_source_likelihood': float(L_src[idx]),
+            'hspf_harm_likelihood': float(L_harm[idx]),
+            'hspf_candidate_health_likelihood': float(L_health[idx]),
+            'hspf_candidate_likelihood': float(L_c[idx]),
+            'hspf_view_prior': float(subset_g[idx]),
+            'hspf_view_likelihood': float(L_view[idx]),
+            'hspf_rule_prior': float(rule_prior[cand['rule']]),
+            'hspf_rule_likelihood': float(L_rule[idx]),
+            'hspf_posterior': float(posterior[idx]),
+        })
+
     return {
         'pred': final_probs.argmax(axis=1),
         'probs': final_probs,
         'posterior': posterior,
         'candidate_rows': rows,
+        'candidate_evidence_rows': evidence_rows,
         'view_gate': view_gate,
         'view_evidence': view_evidence,
         'rule_prior': rule_prior,
         'posterior_entropy_norm': entropy_dist(posterior) / max(np.log(len(candidates)), 1e-12),
     }
+
+
+def distribution_metrics(probs, pred, num_classes, source_prior, source_pred_freq=None, source_prob_mean=None):
+    probs = np.asarray(probs, dtype=np.float64)
+    pred = np.asarray(pred, dtype=int)
+    if probs.shape[0] == 0:
+        pred_freq = np.zeros(num_classes, dtype=np.float64)
+        mean_prob = np.zeros(num_classes, dtype=np.float64)
+    else:
+        pred_freq = pred_frequency(pred, num_classes)
+        mean_prob = np.mean(probs, axis=0)
+
+    rows = {
+        'prior_penalty': kl_divergence(mean_prob, source_prior),
+        'collapse_penalty': float(np.max(pred_freq)) if pred_freq.size else 0.0,
+        'prediction_diversity_risk': 1.0 - entropy_dist(pred_freq) / max(np.log(num_classes), 1e-12),
+        'mean_confidence': mean_confidence(probs),
+        'mean_margin': margin_mean(probs),
+        'mean_entropy': mean_entropy(probs),
+    }
+    if source_pred_freq is not None:
+        rows['pred_freq_js_to_source'] = js_divergence(pred_freq, source_pred_freq)
+    if source_prob_mean is not None:
+        rows['mean_prob_js_to_source'] = js_divergence(mean_prob, source_prob_mean)
+    return rows
+
+
+def prefixed_metrics(prefix, metrics):
+    return {f'{prefix}_{key}': value for key, value in metrics.items()}
+
+
+def build_view_shift_evidence_diagnostics(
+    views, source_outputs, target_outputs, y_source, source_mask, y_target, target_known_mask,
+    num_classes, source_prior
+):
+    rows = []
+    for view in views:
+        source_probs = source_outputs[view]['probs']
+        target_probs = target_outputs[view]['probs']
+        source_pred = source_outputs[view]['pred']
+        target_pred = target_outputs[view]['pred']
+
+        source_known = source_mask
+        correct_mask = target_known_mask & (target_pred == y_target)
+        wrong_mask = target_known_mask & (target_pred != y_target)
+
+        source_pred_freq = pred_frequency(source_pred, num_classes)
+        source_prob_mean = np.mean(source_probs, axis=0)
+        source_metrics = distribution_metrics(source_probs, source_pred, num_classes, source_prior)
+        target_metrics = distribution_metrics(
+            target_probs, target_pred, num_classes, source_prior,
+            source_pred_freq=source_pred_freq, source_prob_mean=source_prob_mean
+        )
+        correct_metrics = distribution_metrics(
+            target_probs[correct_mask], target_pred[correct_mask], num_classes, source_prior,
+            source_pred_freq=source_pred_freq, source_prob_mean=source_prob_mean
+        )
+        wrong_metrics = distribution_metrics(
+            target_probs[wrong_mask], target_pred[wrong_mask], num_classes, source_prior,
+            source_pred_freq=source_pred_freq, source_prob_mean=source_prob_mean
+        )
+
+        row = {
+            'view': view,
+            'target_acc_diagnostic': safe_accuracy(y_target, target_pred, target_known_mask),
+            'target_weighted_f1_diagnostic': weighted_f1_or_none(y_target, target_pred, target_known_mask),
+            'source_acc': safe_accuracy(y_source, source_pred, source_known),
+            'source_weighted_f1': weighted_f1_or_none(y_source, source_pred, source_known),
+            'target_correct_count': int(correct_mask.sum()),
+            'target_wrong_count': int(wrong_mask.sum()),
+            'source_prior_penalty': source_metrics['prior_penalty'],
+            'target_prior_penalty': target_metrics['prior_penalty'],
+            'delta_prior_penalty': target_metrics['prior_penalty'] - source_metrics['prior_penalty'],
+            'correct_prior_penalty': correct_metrics['prior_penalty'],
+            'wrong_prior_penalty': wrong_metrics['prior_penalty'],
+            'wrong_minus_correct_prior_penalty': wrong_metrics['prior_penalty'] - correct_metrics['prior_penalty'],
+            'source_target_pred_freq_js': target_metrics['pred_freq_js_to_source'],
+            'correct_pred_freq_js_to_source': correct_metrics['pred_freq_js_to_source'],
+            'wrong_pred_freq_js_to_source': wrong_metrics['pred_freq_js_to_source'],
+            'wrong_minus_correct_pred_freq_js': wrong_metrics['pred_freq_js_to_source'] - correct_metrics['pred_freq_js_to_source'],
+            'source_target_mean_prob_js': target_metrics['mean_prob_js_to_source'],
+            'correct_mean_prob_js_to_source': correct_metrics['mean_prob_js_to_source'],
+            'wrong_mean_prob_js_to_source': wrong_metrics['mean_prob_js_to_source'],
+            'wrong_minus_correct_mean_prob_js': wrong_metrics['mean_prob_js_to_source'] - correct_metrics['mean_prob_js_to_source'],
+            'source_collapse_penalty': source_metrics['collapse_penalty'],
+            'target_collapse_penalty': target_metrics['collapse_penalty'],
+            'delta_collapse_penalty': target_metrics['collapse_penalty'] - source_metrics['collapse_penalty'],
+            'correct_collapse_penalty': correct_metrics['collapse_penalty'],
+            'wrong_collapse_penalty': wrong_metrics['collapse_penalty'],
+            'wrong_minus_correct_collapse_penalty': wrong_metrics['collapse_penalty'] - correct_metrics['collapse_penalty'],
+            'source_prediction_diversity_risk': source_metrics['prediction_diversity_risk'],
+            'target_prediction_diversity_risk': target_metrics['prediction_diversity_risk'],
+            'delta_prediction_diversity_risk': target_metrics['prediction_diversity_risk'] - source_metrics['prediction_diversity_risk'],
+            'correct_prediction_diversity_risk': correct_metrics['prediction_diversity_risk'],
+            'wrong_prediction_diversity_risk': wrong_metrics['prediction_diversity_risk'],
+            'wrong_minus_correct_prediction_diversity_risk': wrong_metrics['prediction_diversity_risk'] - correct_metrics['prediction_diversity_risk'],
+            'source_mean_confidence': source_metrics['mean_confidence'],
+            'target_mean_confidence': target_metrics['mean_confidence'],
+            'source_target_conf_shift': target_metrics['mean_confidence'] - source_metrics['mean_confidence'],
+            'correct_mean_confidence': correct_metrics['mean_confidence'],
+            'wrong_mean_confidence': wrong_metrics['mean_confidence'],
+            'wrong_minus_correct_confidence': wrong_metrics['mean_confidence'] - correct_metrics['mean_confidence'],
+            'source_mean_margin': source_metrics['mean_margin'],
+            'target_mean_margin': target_metrics['mean_margin'],
+            'source_target_margin_shift': target_metrics['mean_margin'] - source_metrics['mean_margin'],
+            'correct_mean_margin': correct_metrics['mean_margin'],
+            'wrong_mean_margin': wrong_metrics['mean_margin'],
+            'wrong_minus_correct_margin': wrong_metrics['mean_margin'] - correct_metrics['mean_margin'],
+            'source_mean_entropy': source_metrics['mean_entropy'],
+            'target_mean_entropy': target_metrics['mean_entropy'],
+            'correct_mean_entropy': correct_metrics['mean_entropy'],
+            'wrong_mean_entropy': wrong_metrics['mean_entropy'],
+            'wrong_minus_correct_entropy': wrong_metrics['mean_entropy'] - correct_metrics['mean_entropy'],
+        }
+        rows.append(row)
+    return rows
+
+
+def add_candidate_target_diagnostics(candidate_rows, candidates, y_target, target_known_mask):
+    rows = [dict(row) for row in candidate_rows]
+    target_f1 = []
+    target_acc = []
+    for cand in candidates:
+        pred = cand['probs'].argmax(axis=1)
+        target_acc.append(safe_accuracy(y_target, pred, target_known_mask))
+        target_f1.append(weighted_f1_or_none(y_target, pred, target_known_mask))
+
+    f1_values = np.array([
+        -np.inf if value is None else float(value) for value in target_f1
+    ], dtype=np.float64)
+    f1_rank = average_ranks(f1_values, higher_better=True)
+    for row, acc, f1, rank in zip(rows, target_acc, target_f1, f1_rank):
+        row['target_acc_diagnostic'] = acc
+        row['target_weighted_f1_diagnostic'] = f1
+        row['rank_by_target_weighted_f1_diagnostic'] = int(rank) if np.isfinite(rank) else None
+    return rows
+
+
+def evidence_top_indices(values, higher_better, n):
+    values = np.asarray(values, dtype=np.float64)
+    finite = np.where(np.isfinite(values), values, -np.inf if higher_better else np.inf)
+    order = np.argsort(-finite if higher_better else finite, kind='mergesort')
+    return order[:min(n, len(order))]
+
+
+def build_candidate_evidence_summary(candidate_df):
+    if candidate_df.empty or 'target_weighted_f1_diagnostic' not in candidate_df:
+        return []
+    target_f1 = candidate_df['target_weighted_f1_diagnostic'].to_numpy(dtype=np.float64)
+    if not np.isfinite(target_f1).any():
+        return []
+
+    oracle_order = np.argsort(-np.where(np.isfinite(target_f1), target_f1, -np.inf), kind='mergesort')
+    oracle_top1 = int(oracle_order[0])
+    oracle_top3 = set(int(i) for i in oracle_order[:min(3, len(oracle_order))])
+    oracle_top5 = set(int(i) for i in oracle_order[:min(5, len(oracle_order))])
+    oracle_worst3 = set(int(i) for i in oracle_order[-min(3, len(oracle_order)):])
+    rows = []
+    specs = [
+        ('class_balance_risk', False),
+        ('target_im_score', True),
+        ('source_score', True),
+        ('self_harm_penalty', False),
+        ('self_harm_entropy', False),
+        ('self_harm_margin', False),
+        ('self_harm_flip', False),
+        ('self_harm_balance', False),
+        ('hspf_candidate_likelihood', True),
+        ('hspf_posterior', True),
+    ]
+    for evidence, higher_better in specs:
+        if evidence not in candidate_df:
+            continue
+        values = candidate_df[evidence].to_numpy(dtype=np.float64)
+        evidence_order = evidence_top_indices(values, higher_better, len(values))
+        evidence_top3 = set(int(i) for i in evidence_order[:min(3, len(evidence_order))])
+        evidence_top5 = set(int(i) for i in evidence_order[:min(5, len(evidence_order))])
+        evidence_bottom5 = set(int(i) for i in evidence_order[-min(5, len(evidence_order)):])
+        best_group = list(evidence_top5)
+        worst_group = list(evidence_bottom5)
+        best_mean = float(np.nanmean(target_f1[best_group])) if best_group else 0.0
+        worst_mean = float(np.nanmean(target_f1[worst_group])) if worst_group else 0.0
+        rows.append({
+            'evidence': evidence,
+            'higher_better': bool(higher_better),
+            'spearman_with_target_f1': spearman_corr(values, target_f1),
+            'oracle_top1_rank_by_evidence': int(np.where(evidence_order == oracle_top1)[0][0] + 1),
+            'oracle_top1_in_evidence_top3': bool(oracle_top1 in evidence_top3),
+            'oracle_top1_in_evidence_top5': bool(oracle_top1 in evidence_top5),
+            'oracle_top3_overlap_with_evidence_top5': int(len(oracle_top3 & evidence_top5)),
+            'oracle_top5_overlap_with_evidence_top5': int(len(oracle_top5 & evidence_top5)),
+            'worst3_bottom5_rate': float(len(oracle_worst3 & evidence_bottom5) / max(len(oracle_worst3), 1)),
+            'best_evidence_group_mean_target_f1': best_mean,
+            'worst_evidence_group_mean_target_f1': worst_mean,
+            'best_minus_worst_evidence_group_target_f1': best_mean - worst_mean,
+        })
+    return rows
 
 
 def top2_gap(values):
@@ -1807,12 +2103,40 @@ def main():
         idx2label,
         target_known_mask,
     )
+    view_shift_evidence_diagnostics = build_view_shift_evidence_diagnostics(
+        views,
+        source_outputs,
+        target_outputs,
+        y_source,
+        source_mask,
+        y_target,
+        target_known_mask,
+        num_classes,
+        src_prior,
+    )
+    hspf_candidate_evidence_values = add_candidate_target_diagnostics(
+        hspf['candidate_evidence_rows'],
+        hspf_candidates,
+        y_target,
+        target_known_mask,
+    )
+    hspf_candidate_evidence_df = pd.DataFrame(hspf_candidate_evidence_values)
+    hspf_candidate_evidence_diagnostics = build_candidate_evidence_summary(hspf_candidate_evidence_df)
 
     with open(os.path.join(args.output_dir, 'summary.json'), 'w') as f:
         json.dump(summary, f, indent=2)
     per_class_df.to_csv(os.path.join(args.output_dir, 'per_class_metrics.csv'), index=False)
     target_out.to_csv(os.path.join(args.output_dir, 'target_predictions.csv'), index=False)
     pd.DataFrame(hspf['candidate_rows']).to_csv(os.path.join(args.output_dir, 'hspf_candidate_ranking.csv'), index=False)
+    pd.DataFrame(view_shift_evidence_diagnostics).to_csv(
+        os.path.join(args.output_dir, 'view_shift_evidence_diagnostics.csv'), index=False
+    )
+    hspf_candidate_evidence_df.to_csv(
+        os.path.join(args.output_dir, 'hspf_candidate_evidence_values.csv'), index=False
+    )
+    pd.DataFrame(hspf_candidate_evidence_diagnostics).to_csv(
+        os.path.join(args.output_dir, 'hspf_candidate_evidence_diagnostics.csv'), index=False
+    )
     hspf_view_rows = []
     for view in views:
         row = {'view': view, 'gate': hspf['view_gate'][view]}
