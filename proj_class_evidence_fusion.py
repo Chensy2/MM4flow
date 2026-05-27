@@ -752,7 +752,9 @@ def hspf_view_gate(views, source_outputs, target_outputs, num_classes, source_pr
     ]:
         values = np.array([evidence[view][metric] for view in views], dtype=np.float64)
         strengths *= rank_likelihood(values, higher_better=False)
-    strengths = strengths / max(float(strengths.sum()), 1e-12)
+    raw_strengths = strengths / max(float(strengths.sum()), 1e-12)
+    uniform = np.ones_like(raw_strengths, dtype=np.float64) / max(float(len(raw_strengths)), 1.0)
+    strengths = 0.5 * raw_strengths + 0.5 * uniform
     return {view: float(strengths[i]) for i, view in enumerate(views)}, evidence
 
 
@@ -815,7 +817,7 @@ def hspf_run(candidates, views, target_probs_by_view, source_outputs, target_out
     rules = ['identity', 'average', 'prob_class', 'geometry_class', 'agreement_gate']
     rule_scores = {}
     for rule in rules:
-        values = np.array([L_c[i] for i, cand in enumerate(candidates) if cand['rule'] == rule], dtype=np.float64)
+        values = np.array([L_health[i] for i, cand in enumerate(candidates) if cand['rule'] == rule], dtype=np.float64)
         if len(values) == 0:
             rule_scores[rule] = 0.0
         else:
