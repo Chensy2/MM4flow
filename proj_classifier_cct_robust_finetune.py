@@ -629,6 +629,262 @@ def pred_distribution(preds, num_classes):
     return counts, fracs
 
 
+def safe_corr(x, y):
+    x = np.asarray(x, dtype=np.float64)
+    y = np.asarray(y, dtype=np.float64)
+    mask = np.isfinite(x) & np.isfinite(y)
+    x = x[mask]
+    y = y[mask]
+    if x.size < 2 or y.size < 2:
+        return None
+    if np.std(x) < 1e-12 or np.std(y) < 1e-12:
+        return None
+    return float(np.corrcoef(x, y)[0, 1])
+
+
+def rankdata_average(values):
+    values = np.asarray(values, dtype=np.float64)
+    order = np.argsort(values)
+    ranks = np.empty_like(values, dtype=np.float64)
+    start = 0
+    while start < len(values):
+        end = start + 1
+        while end < len(values) and values[order[end]] == values[order[start]]:
+            end += 1
+        ranks[order[start:end]] = np.mean(np.arange(start, end, dtype=np.float64)) + 1.0
+        start = end
+    return ranks
+
+
+def safe_spearman(x, y):
+    x = np.asarray(x, dtype=np.float64)
+    y = np.asarray(y, dtype=np.float64)
+    mask = np.isfinite(x) & np.isfinite(y)
+    x = x[mask]
+    y = y[mask]
+    if x.size < 2 or y.size < 2:
+        return None
+    return safe_corr(rankdata_average(x), rankdata_average(y))
+
+
+def class_assignment_entropy(A, cluster_entropy, target_masses, eps=1e-8):
+    A = np.asarray(A, dtype=np.float64)
+    cluster_entropy = np.asarray(cluster_entropy, dtype=np.float64)
+    target_masses = np.asarray(target_masses, dtype=np.float64)
+    weighted = A * target_masses[:, None]
+    class_mass = np.sum(weighted, axis=0)
+    orphan = class_mass <= float(eps)
+    entropy_by_class = (weighted.T @ cluster_entropy) / np.maximum(class_mass, float(eps))
+    max_entropy = np.log(max(2, A.shape[1]))
+    entropy_by_class[orphan] = max_entropy
+    entropy_norm = entropy_by_class / max(float(eps), max_entropy)
+    entropy_norm[orphan] = 1.0
+    return (
+        entropy_by_class.astype(np.float64),
+        entropy_norm.astype(np.float64),
+        class_mass.astype(np.float64),
+        orphan.astype(bool),
+    )
+
+
+def prediction_im_metrics(probs):
+    probs = np.asarray(probs, dtype=np.float64)
+    mean_prob = np.mean(probs, axis=0)
+    h_global = -float(np.sum(mean_prob * np.log(mean_prob + 1e-12)))
+    h_local = float(np.mean(probs_entropy(probs)))
+    return {
+        "global_entropy": h_global,
+        "local_entropy": h_local,
+        "im_score": h_global - h_local,
+    }
+
+
+def plot_target_eval_metrics(history_rows, output_dir, view):
+    if not history_rows:
+        return None, None
+    df = pd.DataFrame(history_rows)
+    csv_path = os.path.join(output_dir, f"cct_target_eval_history_{view}.csv")
+    json_path = os.path.join(output_dir, f"cct_target_eval_metric_correlations_{view}.json")
+    plot_path = os.path.join(output_dir, f"cct_target_eval_metrics_vs_wf1_{view}.png")
+    df.to_csv(csv_path, index=False)
+
+    corr = {"view": view, "csv_path": csv_path, "plot_path": plot_path}
+    has_wf1 = "target_weighted_f1" in df.columns and df["target_weighted_f1"].notna().any()
+    metrics = ["global_entropy", "local_entropy", "im_score"]
+    if has_wf1:
+        y = df["target_weighted_f1"].values.astype(np.float64)
+        for metric in metrics:
+            x = df[metric].values.astype(np.float64)
+            corr[f"pearson_{metric}_target_wf1"] = safe_corr(x, y)
+            corr[f"spearman_{metric}_target_wf1"] = safe_spearman(x, y)
+    else:
+        for metric in metrics:
+            corr[f"pearson_{metric}_target_wf1"] = None
+            corr[f"spearman_{metric}_target_wf1"] = None
+        plot_path = None
+        corr["plot_path"] = None
+
+    plot_error = None
+    if has_wf1:
+        try:
+            import matplotlib
+
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+
+            fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+            labels = {
+                "global_entropy": "Global Entropy",
+                "local_entropy": "Local Entropy",
+                "im_score": "IM Score",
+            }
+            for ax, metric in zip(axes, metrics):
+                ax.scatter(df[metric], df["target_weighted_f1"], alpha=0.8)
+                ax.plot(df[metric], df["target_weighted_f1"], alpha=0.45)
+                pearson = corr[f"pearson_{metric}_target_wf1"]
+                title = labels[metric]
+                if pearson is not None:
+                    title += f" r={pearson:.3f}"
+                ax.set_title(title)
+                ax.set_xlabel(labels[metric])
+                ax.set_ylabel("Target WF1")
+            fig.suptitle(f"{view}: target probability metrics vs Target WF1")
+            fig.tight_layout()
+            fig.savefig(plot_path, dpi=180)
+            plt.close(fig)
+        except Exception as exc:
+            plot_error = str(exc)
+            plot_path = None
+            corr["plot_path"] = None
+    corr["plot_error"] = plot_error
+    with open(json_path, "w") as f:
+        json.dump(corr, f, indent=2, sort_keys=True)
+    corr["json_path"] = json_path
+    return csv_path, corr
+
+
+def write_class_delta_plot(df, output_dir, view, suffix, title):
+    csv_path = os.path.join(output_dir, f"cct_entropy_delta_f1_{suffix}_{view}.csv")
+    json_path = os.path.join(output_dir, f"cct_entropy_delta_f1_{suffix}_{view}.json")
+    plot_path = os.path.join(output_dir, f"cct_entropy_delta_f1_{suffix}_{view}.png")
+    df.to_csv(csv_path, index=False)
+
+    valid = (df["support"].values > 0) & np.isfinite(df["target_cluster_assignment_entropy"].values)
+    valid &= np.isfinite(df["delta_f1_from_step0"].values)
+    entropy_x = df.loc[valid, "target_cluster_assignment_entropy"].values
+    delta_y = df.loc[valid, "delta_f1_from_step0"].values
+    pearson = safe_corr(entropy_x, delta_y)
+    spearman = safe_spearman(entropy_x, delta_y)
+
+    plot_error = None
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        plt.figure(figsize=(7, 5))
+        sizes = np.clip(df.loc[valid, "support"].values.astype(np.float64), 1.0, None)
+        sizes = 25.0 + 125.0 * sizes / max(1.0, np.max(sizes))
+        plt.scatter(entropy_x, delta_y, s=sizes, alpha=0.75, edgecolors="black", linewidths=0.4)
+        plt.axhline(0.0, color="gray", linestyle="--", linewidth=1.0)
+        plot_title = title
+        if pearson is not None:
+            plot_title += f" | r={pearson:.3f}"
+        if spearman is not None:
+            plot_title += f", rho={spearman:.3f}"
+        plt.title(plot_title)
+        plt.xlabel("Class target-cluster assignment entropy")
+        plt.ylabel("Delta F1 from step 0")
+        plt.tight_layout()
+        plt.savefig(plot_path, dpi=180)
+        plt.close()
+    except Exception as exc:
+        plot_error = str(exc)
+        plot_path = None
+
+    analysis = {
+        "view": view,
+        "suffix": suffix,
+        "num_classes": int(len(df)),
+        "num_classes_with_support": int(np.sum(valid)),
+        "pearson_entropy_delta_f1": pearson,
+        "spearman_entropy_delta_f1": spearman,
+        "mean_delta_f1": float(np.mean(delta_y)) if delta_y.size else None,
+        "median_delta_f1": float(np.median(delta_y)) if delta_y.size else None,
+        "mean_entropy": float(np.mean(entropy_x)) if entropy_x.size else None,
+        "median_entropy": float(np.median(entropy_x)) if entropy_x.size else None,
+        "csv_path": csv_path,
+        "plot_path": plot_path,
+        "plot_error": plot_error,
+    }
+    with open(json_path, "w") as f:
+        json.dump(analysis, f, indent=2, sort_keys=True)
+    analysis["json_path"] = json_path
+    return analysis
+
+
+def write_entropy_delta_f1_diagnostics(
+    *,
+    output_dir,
+    view,
+    idx2label,
+    target_labels,
+    base_preds,
+    robust_preds,
+    A,
+    cluster_entropy,
+    target_masses,
+    delta_norms,
+    base_counts,
+    base_fracs,
+    robust_counts,
+    robust_fracs,
+):
+    y_true = target_labels.detach().cpu().numpy().astype(np.int64)
+    num_classes = len(idx2label)
+    labels = np.arange(num_classes, dtype=np.int64)
+    base_p, base_r, base_f1, support = precision_recall_fscore_support(
+        y_true, base_preds, labels=labels, average=None, zero_division=0
+    )
+    robust_p, robust_r, robust_f1, _ = precision_recall_fscore_support(
+        y_true, robust_preds, labels=labels, average=None, zero_division=0
+    )
+    cls_entropy, cls_entropy_norm, cls_mass, orphan = class_assignment_entropy(A, cluster_entropy, target_masses)
+    delta_f1 = robust_f1 - base_f1
+
+    rows = []
+    for i in range(num_classes):
+        rows.append(
+            {
+                "class_idx": int(i),
+                "class": idx2label[i],
+                "support": int(support[i]),
+                "f1_before_step0": float(base_f1[i]),
+                "f1_after": float(robust_f1[i]),
+                "delta_f1_from_step0": float(delta_f1[i]),
+                "f1_before": float(base_f1[i]),
+                "delta_f1": float(delta_f1[i]),
+                "precision_before": float(base_p[i]),
+                "precision_after": float(robust_p[i]),
+                "recall_before": float(base_r[i]),
+                "recall_after": float(robust_r[i]),
+                "target_cluster_assignment_entropy": float(cls_entropy[i]),
+                "target_cluster_assignment_entropy_norm": float(cls_entropy_norm[i]),
+                "target_cluster_soft_mass": float(cls_mass[i]),
+                "is_orphan_class": bool(orphan[i]),
+                "delta_norm": float(delta_norms[i]),
+                "base_pred_count": int(base_counts[i]),
+                "robust_pred_count": int(robust_counts[i]),
+                "base_pred_frac": float(base_fracs[i]),
+                "robust_pred_frac": float(robust_fracs[i]),
+            }
+        )
+
+    df = pd.DataFrame(rows)
+    return write_class_delta_plot(df, output_dir, view, "final", f"{view}: final target cluster entropy vs Delta F1")
+
+
 def train_cct_head(
     head,
     train_features,
@@ -645,11 +901,12 @@ def train_cct_head(
     shift_weight,
     anchor_weight,
     cct_shift_rho,
+    eval_callback=None,
 ):
     head = head.to(device)
     head.train()
     head_orig_state = copy.deepcopy({k: v.detach().cpu().clone() for k, v in head.state_dict().items()})
-    opt = torch.optim.AdamW(head.parameters(), lr=lr)
+    opt = torch.optim.Adam(head.parameters(), lr=lr, eps=1e-8)
 
     train_features = train_features.to(device)
     train_labels = train_labels.to(device)
@@ -664,6 +921,8 @@ def train_cct_head(
     base_val_weighted_f1 = float(base_val["weighted_f1"])
 
     best = {"step": -1, "metrics": None, "state": None}
+    if eval_callback is not None:
+        eval_callback(0, head)
 
     for step in range(1, steps + 1):
         idx = rng.integers(low=0, high=n, size=batch_size, endpoint=False)
@@ -688,6 +947,8 @@ def train_cct_head(
 
         if eval_every > 0 and (step % eval_every == 0 or step == steps):
             metrics = evaluate_head(head, val_features, val_labels)
+            if eval_callback is not None:
+                eval_callback(step, head)
             score = float(metrics.get(select_best, metrics["weighted_f1"]))
             if best["metrics"] is None or score > float(best["metrics"].get(select_best, -1e9)):
                 best = {"step": step, "metrics": metrics, "state": copy.deepcopy({k: v.detach().cpu().clone() for k, v in head.state_dict().items()})}
@@ -942,6 +1203,133 @@ def main():
 
         base_head_state = copy.deepcopy({k: v.detach().cpu().clone() for k, v in head.state_dict().items()})
         delta_torch = torch.from_numpy(delta)
+        head = head.to(device)
+        entropy_delta_f1_history = []
+        entropy_delta_f1_history_path = None
+        entropy_delta_f1_correlations = []
+        entropy_delta_f1_correlations_path = None
+        target_eval_history = []
+        target_eval_history_path = None
+        target_eval_metric_analysis = None
+        best_target_wf1 = {"step": None, "weighted_f1": None, "rows": None, "pearson": None, "spearman": None}
+        best_target_wf1_analysis = None
+        eval_base_preds = None
+        eval_base_f1 = None
+        eval_support = None
+        eval_class_entropy = None
+        eval_class_entropy_norm = None
+        eval_class_mass = None
+        eval_orphan = None
+        eval_base_counts = None
+        eval_base_fracs = None
+        if args.eval_target_after_train and target_has_label and target_labels is not None:
+            base_eval_for_history = evaluate_head_probs(head, target_features, target_labels, report_topk=args.report_topk)
+            eval_base_preds = base_eval_for_history["preds"]
+            target_y_np = target_labels.detach().cpu().numpy().astype(np.int64)
+            _, _, eval_base_f1, eval_support = precision_recall_fscore_support(
+                target_y_np,
+                eval_base_preds,
+                labels=np.arange(num_classes, dtype=np.int64),
+                average=None,
+                zero_division=0,
+            )
+            eval_class_entropy, eval_class_entropy_norm, eval_class_mass, eval_orphan = class_assignment_entropy(
+                A, ent, target_masses
+            )
+            eval_base_counts, eval_base_fracs = pred_distribution(eval_base_preds, num_classes)
+
+        def record_eval_entropy_delta_f1(step, current_head):
+            current_eval = evaluate_head_probs(
+                current_head,
+                target_features,
+                target_labels if target_has_label and target_labels is not None else None,
+                report_topk=args.report_topk,
+            )
+            im_metrics = prediction_im_metrics(current_eval["probs"])
+            eval_row = {
+                "step": int(step),
+                "view": view,
+                **im_metrics,
+            }
+            if target_has_label and target_labels is not None:
+                eval_row.update(
+                    {
+                        "target_acc": current_eval.get("acc"),
+                        "target_weighted_f1": current_eval.get("weighted_f1"),
+                        "target_top2": current_eval.get("top2"),
+                        "target_top3": current_eval.get("top3"),
+                    }
+                )
+            target_eval_history.append(eval_row)
+
+            if eval_base_preds is None:
+                return
+            current_preds = current_eval["preds"]
+            current_counts, current_fracs = pred_distribution(current_preds, num_classes)
+            target_y_np = target_labels.detach().cpu().numpy().astype(np.int64)
+            _, _, current_f1, _ = precision_recall_fscore_support(
+                target_y_np,
+                current_preds,
+                labels=np.arange(num_classes, dtype=np.int64),
+                average=None,
+                zero_division=0,
+            )
+            delta_f1_step = current_f1 - eval_base_f1
+            valid = (eval_support > 0) & np.isfinite(eval_class_entropy) & np.isfinite(delta_f1_step)
+            pearson = safe_corr(eval_class_entropy[valid], delta_f1_step[valid])
+            spearman = safe_spearman(eval_class_entropy[valid], delta_f1_step[valid])
+            entropy_delta_f1_correlations.append(
+                {
+                    "step": int(step),
+                    "view": view,
+                    "target_weighted_f1": current_eval.get("weighted_f1"),
+                    "target_acc": current_eval.get("acc"),
+                    "pearson_entropy_delta_f1_at_step": pearson,
+                    "spearman_entropy_delta_f1_at_step": spearman,
+                    "global_entropy": im_metrics["global_entropy"],
+                    "local_entropy": im_metrics["local_entropy"],
+                    "im_score": im_metrics["im_score"],
+                }
+            )
+            step_rows = []
+            for cls_idx in range(num_classes):
+                row = {
+                    "step": int(step),
+                    "view": view,
+                    "class_idx": int(cls_idx),
+                    "class": idx2label[cls_idx],
+                    "support": int(eval_support[cls_idx]),
+                    "f1_before_step0": float(eval_base_f1[cls_idx]),
+                    "f1_after": float(current_f1[cls_idx]),
+                    "delta_f1_from_step0": float(delta_f1_step[cls_idx]),
+                    "target_cluster_assignment_entropy": float(eval_class_entropy[cls_idx]),
+                    "target_cluster_assignment_entropy_norm": float(eval_class_entropy_norm[cls_idx]),
+                    "target_cluster_soft_mass": float(eval_class_mass[cls_idx]),
+                    "is_orphan_class": bool(eval_orphan[cls_idx]),
+                    "delta_norm": float(delta_norms[cls_idx]),
+                    "base_pred_count": int(eval_base_counts[cls_idx]),
+                    "current_pred_count": int(current_counts[cls_idx]),
+                    "base_pred_frac": float(eval_base_fracs[cls_idx]),
+                    "current_pred_frac": float(current_fracs[cls_idx]),
+                    "pearson_entropy_delta_f1_at_step": pearson,
+                    "spearman_entropy_delta_f1_at_step": spearman,
+                }
+                step_rows.append(row)
+                entropy_delta_f1_history.append(row)
+            wf1 = current_eval.get("weighted_f1")
+            if wf1 is not None and (
+                best_target_wf1["weighted_f1"] is None or float(wf1) > float(best_target_wf1["weighted_f1"])
+            ):
+                best_target_wf1.update(
+                    {
+                        "step": int(step),
+                        "weighted_f1": float(wf1),
+                        "rows": copy.deepcopy(step_rows),
+                        "pearson": pearson,
+                        "spearman": spearman,
+                    }
+                )
+
         base_val_weighted_f1, best = train_cct_head(
             head,
             train_features,
@@ -957,7 +1345,29 @@ def main():
             shift_weight=args.shift_weight,
             anchor_weight=args.anchor_weight,
             cct_shift_rho=args.cct_shift_rho,
+            eval_callback=record_eval_entropy_delta_f1 if args.eval_target_after_train else None,
         )
+        if entropy_delta_f1_history:
+            entropy_delta_f1_history_path = os.path.join(args.output_dir, f"cct_entropy_delta_f1_history_{view}.csv")
+            pd.DataFrame(entropy_delta_f1_history).to_csv(entropy_delta_f1_history_path, index=False)
+        if entropy_delta_f1_correlations:
+            entropy_delta_f1_correlations_path = os.path.join(
+                args.output_dir, f"cct_entropy_delta_f1_correlations_{view}.csv"
+            )
+            pd.DataFrame(entropy_delta_f1_correlations).to_csv(entropy_delta_f1_correlations_path, index=False)
+        if target_eval_history:
+            target_eval_history_path, target_eval_metric_analysis = plot_target_eval_metrics(
+                target_eval_history, args.output_dir, view
+            )
+        if best_target_wf1["rows"] is not None:
+            best_df = pd.DataFrame(best_target_wf1["rows"])
+            best_target_wf1_analysis = write_class_delta_plot(
+                best_df,
+                args.output_dir,
+                view,
+                "best_target_wf1",
+                f"{view}: best target WF1 step {best_target_wf1['step']} entropy vs Delta F1",
+            )
 
         # Target diagnostics: base vs robust (for analysis only; no target labels used in training/selection).
         base_target_metrics = None
@@ -965,6 +1375,7 @@ def main():
         counts_csv_path = None
         pred_csv_path = None
         stats_path = None
+        entropy_delta_f1_analysis = None
         if args.eval_target_after_train:
             base_head = copy.deepcopy(head).to(device)
             base_head.load_state_dict(base_head_state, strict=True)
@@ -985,6 +1396,22 @@ def main():
             if target_has_label:
                 base_target_metrics = {k: base_eval.get(k) for k in ["acc", "weighted_f1", "top2", "top3"] if k in base_eval}
                 robust_target_metrics = {k: robust_eval.get(k) for k in ["acc", "weighted_f1", "top2", "top3"] if k in robust_eval}
+                entropy_delta_f1_analysis = write_entropy_delta_f1_diagnostics(
+                    output_dir=args.output_dir,
+                    view=view,
+                    idx2label=idx2label,
+                    target_labels=target_labels,
+                    base_preds=base_preds,
+                    robust_preds=robust_preds,
+                    A=A,
+                    cluster_entropy=ent,
+                    target_masses=target_masses,
+                    delta_norms=delta_norms,
+                    base_counts=base_counts,
+                    base_fracs=base_fracs,
+                    robust_counts=robust_counts,
+                    robust_fracs=robust_fracs,
+                )
 
             pred_stats = {
                 "view": view,
@@ -992,6 +1419,7 @@ def main():
                 "target_has_label": bool(target_has_label),
                 "base_target_metrics": base_target_metrics,
                 "robust_target_metrics": robust_target_metrics,
+                "class_entropy_delta_f1_analysis": entropy_delta_f1_analysis,
                 "prediction_entropy_before_after": {
                     "base": {
                         "mean_entropy": float(np.mean(ent_base)),
@@ -1091,6 +1519,23 @@ def main():
             "target_pred_stats_path": stats_path,
             "target_pred_counts_path": counts_csv_path,
             "target_pred_csv_path": pred_csv_path,
+            "entropy_delta_f1_csv_path": None if entropy_delta_f1_analysis is None else entropy_delta_f1_analysis.get("csv_path"),
+            "entropy_delta_f1_json_path": None if entropy_delta_f1_analysis is None else entropy_delta_f1_analysis.get("json_path"),
+            "entropy_delta_f1_plot_path": None if entropy_delta_f1_analysis is None else entropy_delta_f1_analysis.get("plot_path"),
+            "entropy_delta_f1_history_csv_path": entropy_delta_f1_history_path,
+            "entropy_delta_f1_correlations_csv_path": entropy_delta_f1_correlations_path,
+            "best_target_wf1_step": best_target_wf1["step"],
+            "best_target_wf1": best_target_wf1["weighted_f1"],
+            "best_target_wf1_entropy_delta_f1_csv_path": None if best_target_wf1_analysis is None else best_target_wf1_analysis.get("csv_path"),
+            "best_target_wf1_entropy_delta_f1_json_path": None if best_target_wf1_analysis is None else best_target_wf1_analysis.get("json_path"),
+            "best_target_wf1_entropy_delta_f1_plot_path": None if best_target_wf1_analysis is None else best_target_wf1_analysis.get("plot_path"),
+            "target_eval_history_csv_path": target_eval_history_path,
+            "target_eval_metric_correlations_json_path": None if target_eval_metric_analysis is None else target_eval_metric_analysis.get("json_path"),
+            "target_eval_metric_plot_path": None if target_eval_metric_analysis is None else target_eval_metric_analysis.get("plot_path"),
+            "pearson_im_score_target_wf1": None if target_eval_metric_analysis is None else target_eval_metric_analysis.get("pearson_im_score_target_wf1"),
+            "spearman_im_score_target_wf1": None if target_eval_metric_analysis is None else target_eval_metric_analysis.get("spearman_im_score_target_wf1"),
+            "pearson_entropy_delta_f1": None if entropy_delta_f1_analysis is None else entropy_delta_f1_analysis.get("pearson_entropy_delta_f1"),
+            "spearman_entropy_delta_f1": None if entropy_delta_f1_analysis is None else entropy_delta_f1_analysis.get("spearman_entropy_delta_f1"),
         }
         with open(os.path.join(args.output_dir, f"cct_summary_{view}.json"), "w") as f:
             json.dump(cct_summary_view, f, indent=2, sort_keys=True)
@@ -1153,6 +1598,23 @@ def main():
             "target_pred_stats_path": stats_path,
             "target_pred_counts_path": counts_csv_path,
             "target_pred_csv_path": pred_csv_path,
+            "entropy_delta_f1_csv_path": cct_summary_view["entropy_delta_f1_csv_path"],
+            "entropy_delta_f1_json_path": cct_summary_view["entropy_delta_f1_json_path"],
+            "entropy_delta_f1_plot_path": cct_summary_view["entropy_delta_f1_plot_path"],
+            "entropy_delta_f1_history_csv_path": cct_summary_view["entropy_delta_f1_history_csv_path"],
+            "entropy_delta_f1_correlations_csv_path": cct_summary_view["entropy_delta_f1_correlations_csv_path"],
+            "best_target_wf1_step": cct_summary_view["best_target_wf1_step"],
+            "best_target_wf1": cct_summary_view["best_target_wf1"],
+            "best_target_wf1_entropy_delta_f1_csv_path": cct_summary_view["best_target_wf1_entropy_delta_f1_csv_path"],
+            "best_target_wf1_entropy_delta_f1_json_path": cct_summary_view["best_target_wf1_entropy_delta_f1_json_path"],
+            "best_target_wf1_entropy_delta_f1_plot_path": cct_summary_view["best_target_wf1_entropy_delta_f1_plot_path"],
+            "target_eval_history_csv_path": cct_summary_view["target_eval_history_csv_path"],
+            "target_eval_metric_correlations_json_path": cct_summary_view["target_eval_metric_correlations_json_path"],
+            "target_eval_metric_plot_path": cct_summary_view["target_eval_metric_plot_path"],
+            "pearson_im_score_target_wf1": cct_summary_view["pearson_im_score_target_wf1"],
+            "spearman_im_score_target_wf1": cct_summary_view["spearman_im_score_target_wf1"],
+            "pearson_entropy_delta_f1": cct_summary_view["pearson_entropy_delta_f1"],
+            "spearman_entropy_delta_f1": cct_summary_view["spearman_entropy_delta_f1"],
         }
         with open(os.path.join(new_root, "info.json"), "w") as f:
             json.dump(robust_info, f, indent=2, sort_keys=True)
@@ -1174,6 +1636,20 @@ def main():
             "source_proto_count_max": cct_summary_view["source_proto_count_max"],
             **delta_norm_stats,
             **assignment_entropy_stats,
+            "pearson_entropy_delta_f1": cct_summary_view["pearson_entropy_delta_f1"],
+            "spearman_entropy_delta_f1": cct_summary_view["spearman_entropy_delta_f1"],
+            "entropy_delta_f1_csv_path": cct_summary_view["entropy_delta_f1_csv_path"],
+            "entropy_delta_f1_plot_path": cct_summary_view["entropy_delta_f1_plot_path"],
+            "entropy_delta_f1_history_csv_path": cct_summary_view["entropy_delta_f1_history_csv_path"],
+            "entropy_delta_f1_correlations_csv_path": cct_summary_view["entropy_delta_f1_correlations_csv_path"],
+            "best_target_wf1_step": cct_summary_view["best_target_wf1_step"],
+            "best_target_wf1": cct_summary_view["best_target_wf1"],
+            "best_target_wf1_entropy_delta_f1_csv_path": cct_summary_view["best_target_wf1_entropy_delta_f1_csv_path"],
+            "best_target_wf1_entropy_delta_f1_plot_path": cct_summary_view["best_target_wf1_entropy_delta_f1_plot_path"],
+            "target_eval_history_csv_path": cct_summary_view["target_eval_history_csv_path"],
+            "target_eval_metric_plot_path": cct_summary_view["target_eval_metric_plot_path"],
+            "pearson_im_score_target_wf1": cct_summary_view["pearson_im_score_target_wf1"],
+            "spearman_im_score_target_wf1": cct_summary_view["spearman_im_score_target_wf1"],
         }
 
     out_path = os.path.join("model-classifier", f"cct_robust_classifier_summary_{datetime.now().strftime('%Y%m%d%H%M%S')}.json")

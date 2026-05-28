@@ -341,7 +341,7 @@ def train_robust_head(
     head_orig = copy.deepcopy(head.state_dict())
     for p in head.parameters():
         p.requires_grad_(True)
-    opt = torch.optim.AdamW(head.parameters(), lr=lr)
+    opt = torch.optim.Adam(head.parameters(), lr=lr, eps=1e-8)
 
     sigma2_by_class = sigma2_by_class.to(device)
     train_features = train_features.to(device)
