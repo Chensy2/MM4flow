@@ -629,6 +629,75 @@ def pred_distribution(preds, num_classes):
     return counts, fracs
 
 
+def point_to_center_distance(points, center, metric):
+    points = np.asarray(points, dtype=np.float64)
+    center = np.asarray(center, dtype=np.float64)
+    if points.size == 0:
+        return np.asarray([], dtype=np.float64)
+    if metric == "euclidean":
+        return np.linalg.norm(points - center[None, :], axis=1)
+    points_n = _l2_normalize(points)
+    center_norm = max(1e-12, np.linalg.norm(center))
+    center_n = center / center_norm
+    return 1.0 - (points_n @ center_n.reshape(-1, 1)).reshape(-1)
+
+
+def target_cluster_intra_distances(features, cluster_ids, centers, metric):
+    features = np.asarray(features, dtype=np.float32)
+    cluster_ids = np.asarray(cluster_ids, dtype=np.int64)
+    centers = np.asarray(centers, dtype=np.float32)
+    K = centers.shape[0]
+    intra = np.zeros((K,), dtype=np.float64)
+    for k in range(K):
+        idx = np.where(cluster_ids == k)[0]
+        if len(idx) == 0:
+            intra[k] = 0.0
+        else:
+            intra[k] = float(np.mean(point_to_center_distance(features[idx], centers[k], metric)))
+    return intra.astype(np.float64)
+
+
+def class_weighted_cluster_stat(A, target_masses, cluster_values, eps=1e-8, orphan_value=None):
+    A = np.asarray(A, dtype=np.float64)
+    target_masses = np.asarray(target_masses, dtype=np.float64)
+    cluster_values = np.asarray(cluster_values, dtype=np.float64)
+    weighted = A * target_masses[:, None]
+    class_mass = np.sum(weighted, axis=0)
+    values = (weighted.T @ cluster_values) / np.maximum(class_mass, float(eps))
+    orphan = class_mass <= float(eps)
+    if orphan_value is not None:
+        values[orphan] = float(orphan_value)
+    return values.astype(np.float64), class_mass.astype(np.float64), orphan.astype(bool)
+
+
+def normalize_positive(values, orphan=None, eps=1e-8):
+    values = np.asarray(values, dtype=np.float64)
+    mask = np.isfinite(values)
+    if orphan is not None:
+        mask &= ~np.asarray(orphan, dtype=bool)
+    if not np.any(mask):
+        return np.ones_like(values, dtype=np.float64)
+    scale = float(np.percentile(values[mask], 90))
+    if scale < float(eps):
+        scale = float(np.max(values[mask]))
+    if scale < float(eps):
+        scale = 1.0
+    out = values / scale
+    out = np.clip(out, 0.0, 10.0)
+    if orphan is not None:
+        out[np.asarray(orphan, dtype=bool)] = 1.0
+    return out.astype(np.float64)
+
+
+def class_shift_reliability(entropy_norm, intra_distance_norm, orphan=None):
+    entropy_norm = np.asarray(entropy_norm, dtype=np.float64)
+    intra_distance_norm = np.asarray(intra_distance_norm, dtype=np.float64)
+    reliability = np.exp(-entropy_norm) * np.exp(-intra_distance_norm)
+    if orphan is not None:
+        reliability[np.asarray(orphan, dtype=bool)] = 0.0
+    return reliability.astype(np.float64)
+
+
 def safe_corr(x, y):
     x = np.asarray(x, dtype=np.float64)
     y = np.asarray(y, dtype=np.float64)
@@ -824,6 +893,70 @@ def write_class_delta_plot(df, output_dir, view, suffix, title):
     return analysis
 
 
+def write_reliability_delta_plots(df, output_dir, view, suffix, title):
+    csv_path = os.path.join(output_dir, f"cct_reliability_delta_f1_{suffix}_{view}.csv")
+    json_path = os.path.join(output_dir, f"cct_reliability_delta_f1_{suffix}_{view}.json")
+    plot_path = os.path.join(output_dir, f"cct_reliability_delta_f1_{suffix}_{view}.png")
+    df.to_csv(csv_path, index=False)
+
+    metric_specs = [
+        ("target_cluster_assignment_entropy", "Assignment Entropy"),
+        ("target_cluster_intra_distance", "Target Intra-Cluster Distance"),
+        ("shift_reliability", "Shift Reliability"),
+    ]
+    analysis = {"view": view, "suffix": suffix, "csv_path": csv_path, "plot_path": plot_path}
+    for key, _ in metric_specs:
+        valid = (df["support"].values > 0) & np.isfinite(df[key].values)
+        valid &= np.isfinite(df["delta_f1_from_step0"].values)
+        x = df.loc[valid, key].values
+        y = df.loc[valid, "delta_f1_from_step0"].values
+        analysis[f"pearson_{key}_delta_f1"] = safe_corr(x, y)
+        analysis[f"spearman_{key}_delta_f1"] = safe_spearman(x, y)
+
+    plot_error = None
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+        for ax, (key, label) in zip(axes, metric_specs):
+            valid = (df["support"].values > 0) & np.isfinite(df[key].values)
+            valid &= np.isfinite(df["delta_f1_from_step0"].values)
+            sizes = np.clip(df.loc[valid, "support"].values.astype(np.float64), 1.0, None)
+            sizes = 20.0 + 100.0 * sizes / max(1.0, np.max(sizes))
+            ax.scatter(
+                df.loc[valid, key].values,
+                df.loc[valid, "delta_f1_from_step0"].values,
+                s=sizes,
+                alpha=0.75,
+                edgecolors="black",
+                linewidths=0.35,
+            )
+            ax.axhline(0.0, color="gray", linestyle="--", linewidth=1.0)
+            pearson = analysis[f"pearson_{key}_delta_f1"]
+            subtitle = label
+            if pearson is not None:
+                subtitle += f" r={pearson:.3f}"
+            ax.set_title(subtitle)
+            ax.set_xlabel(label)
+            ax.set_ylabel("Delta F1 from step 0")
+        fig.suptitle(title)
+        fig.tight_layout()
+        fig.savefig(plot_path, dpi=180)
+        plt.close(fig)
+    except Exception as exc:
+        plot_error = str(exc)
+        plot_path = None
+        analysis["plot_path"] = None
+    analysis["plot_error"] = plot_error
+    with open(json_path, "w") as f:
+        json.dump(analysis, f, indent=2, sort_keys=True)
+    analysis["json_path"] = json_path
+    return analysis
+
+
 def write_entropy_delta_f1_diagnostics(
     *,
     output_dir,
@@ -840,6 +973,9 @@ def write_entropy_delta_f1_diagnostics(
     base_fracs,
     robust_counts,
     robust_fracs,
+    class_intra_distance=None,
+    class_intra_distance_norm=None,
+    shift_reliability=None,
 ):
     y_true = target_labels.detach().cpu().numpy().astype(np.int64)
     num_classes = len(idx2label)
@@ -851,6 +987,12 @@ def write_entropy_delta_f1_diagnostics(
         y_true, robust_preds, labels=labels, average=None, zero_division=0
     )
     cls_entropy, cls_entropy_norm, cls_mass, orphan = class_assignment_entropy(A, cluster_entropy, target_masses)
+    if class_intra_distance is None:
+        class_intra_distance = np.zeros((num_classes,), dtype=np.float64)
+    if class_intra_distance_norm is None:
+        class_intra_distance_norm = np.zeros((num_classes,), dtype=np.float64)
+    if shift_reliability is None:
+        shift_reliability = class_shift_reliability(cls_entropy_norm, class_intra_distance_norm, orphan)
     delta_f1 = robust_f1 - base_f1
 
     rows = []
@@ -873,6 +1015,9 @@ def write_entropy_delta_f1_diagnostics(
                 "target_cluster_assignment_entropy_norm": float(cls_entropy_norm[i]),
                 "target_cluster_soft_mass": float(cls_mass[i]),
                 "is_orphan_class": bool(orphan[i]),
+                "target_cluster_intra_distance": float(class_intra_distance[i]),
+                "target_cluster_intra_distance_norm": float(class_intra_distance_norm[i]),
+                "shift_reliability": float(shift_reliability[i]),
                 "delta_norm": float(delta_norms[i]),
                 "base_pred_count": int(base_counts[i]),
                 "robust_pred_count": int(robust_counts[i]),
@@ -882,7 +1027,180 @@ def write_entropy_delta_f1_diagnostics(
         )
 
     df = pd.DataFrame(rows)
-    return write_class_delta_plot(df, output_dir, view, "final", f"{view}: final target cluster entropy vs Delta F1")
+    analysis = write_class_delta_plot(df, output_dir, view, "final", f"{view}: final target cluster entropy vs Delta F1")
+    reliability_analysis = write_reliability_delta_plots(
+        df, output_dir, view, "final", f"{view}: final reliability diagnostics vs Delta F1"
+    )
+    analysis["reliability_analysis"] = reliability_analysis
+    return analysis
+
+
+def pseudo_metric_on_mask(preds, pseudo_labels, mask, num_classes):
+    mask = np.asarray(mask, dtype=bool)
+    if not np.any(mask):
+        return {"n": 0, "acc": None, "weighted_f1": None}
+    y = np.asarray(pseudo_labels, dtype=np.int64)[mask]
+    p = np.asarray(preds, dtype=np.int64)[mask]
+    acc = float(np.mean(p == y))
+    _, _, f1, _ = precision_recall_fscore_support(
+        y, p, labels=np.arange(num_classes, dtype=np.int64), average="weighted", zero_division=0
+    )
+    return {"n": int(np.sum(mask)), "acc": acc, "weighted_f1": float(f1)}
+
+
+def write_pseudo_agreement_audit(output_dir, idx2label, pseudo_cache, target_labels=None):
+    views = [v for v in ["ps", "byte", "mm"] if v in pseudo_cache]
+    if len(views) < 2:
+        return None
+
+    lengths = [len(pseudo_cache[v]["base_preds"]) for v in views]
+    n = min(lengths)
+    if len(set(lengths)) != 1:
+        print(f"[CCT][PseudoAudit] Warning: target prediction lengths differ {dict(zip(views, lengths))}; using first {n}.")
+    num_classes = len(idx2label)
+    base_preds = {v: np.asarray(pseudo_cache[v]["base_preds"][:n], dtype=np.int64) for v in views}
+    robust_preds = {v: np.asarray(pseudo_cache[v]["robust_preds"][:n], dtype=np.int64) for v in views}
+    y_true = None
+    if target_labels is not None:
+        y_true = np.asarray(target_labels[:n], dtype=np.int64)
+
+    groups = []
+    if len(views) >= 3 and all(v in base_preds for v in ["ps", "byte", "mm"]):
+        ps, byte, mm = base_preds["ps"], base_preds["byte"], base_preds["mm"]
+        mask3 = (ps == byte) & (ps == mm)
+        groups.append(("agree3", "ps+byte+mm", "", mask3, ps))
+        pairs = [
+            ("agree2_ps_byte", "ps+byte", "mm", (ps == byte) & (ps != mm), ps),
+            ("agree2_ps_mm", "ps+mm", "byte", (ps == mm) & (ps != byte), ps),
+            ("agree2_byte_mm", "byte+mm", "ps", (byte == mm) & (byte != ps), byte),
+        ]
+        groups.extend(pairs)
+    else:
+        for i in range(len(views)):
+            for j in range(i + 1, len(views)):
+                v1, v2 = views[i], views[j]
+                mask = base_preds[v1] == base_preds[v2]
+                groups.append((f"agree2_{v1}_{v2}", f"{v1}+{v2}", "", mask, base_preds[v1]))
+
+    summary_rows = []
+    class_rows = []
+    view_rows = []
+    sample_frames = []
+    for group_name, source_views, heldout_view, mask, pseudo_labels in groups:
+        mask = np.asarray(mask, dtype=bool)
+        selected = int(np.sum(mask))
+        if selected == 0:
+            pseudo_acc = None
+        elif y_true is None:
+            pseudo_acc = None
+        else:
+            pseudo_acc = float(np.mean(pseudo_labels[mask] == y_true[mask]))
+        counts = np.bincount(pseudo_labels[mask], minlength=num_classes).astype(np.int64) if selected else np.zeros(num_classes, dtype=np.int64)
+        summary_rows.append(
+            {
+                "group": group_name,
+                "source_views": source_views,
+                "heldout_view": heldout_view,
+                "n": selected,
+                "coverage": float(selected / max(1, n)),
+                "pseudo_acc_if_labeled": pseudo_acc,
+                "num_pseudo_classes": int(np.sum(counts > 0)),
+                "max_class_frac": float(np.max(counts) / max(1, selected)) if selected else 0.0,
+            }
+        )
+
+        if selected:
+            df_sample = pd.DataFrame(
+                {
+                    "sample_idx": np.where(mask)[0].astype(np.int64),
+                    "group": group_name,
+                    "source_views": source_views,
+                    "heldout_view": heldout_view,
+                    "pseudo_label_idx": pseudo_labels[mask].astype(np.int64),
+                    "pseudo_label": [idx2label[int(i)] for i in pseudo_labels[mask]],
+                }
+            )
+            if y_true is not None:
+                df_sample["target_label_idx"] = y_true[mask].astype(np.int64)
+                df_sample["target_label"] = [idx2label[int(i)] for i in y_true[mask]]
+                df_sample["pseudo_correct"] = df_sample["pseudo_label_idx"].values == df_sample["target_label_idx"].values
+            for v in views:
+                df_sample[f"{v}_base_pred_idx"] = base_preds[v][mask]
+                df_sample[f"{v}_base_pred"] = [idx2label[int(i)] for i in base_preds[v][mask]]
+                df_sample[f"{v}_robust_pred_idx"] = robust_preds[v][mask]
+                df_sample[f"{v}_robust_pred"] = [idx2label[int(i)] for i in robust_preds[v][mask]]
+            sample_frames.append(df_sample)
+
+        for v in views:
+            base_metric = pseudo_metric_on_mask(base_preds[v], pseudo_labels, mask, num_classes)
+            robust_metric = pseudo_metric_on_mask(robust_preds[v], pseudo_labels, mask, num_classes)
+            view_rows.append(
+                {
+                    "group": group_name,
+                    "view": v,
+                    "source_views": source_views,
+                    "heldout_view": heldout_view,
+                    "is_heldout_view": bool(v == heldout_view),
+                    "n": selected,
+                    "base_acc_vs_pseudo": base_metric["acc"],
+                    "robust_acc_vs_pseudo": robust_metric["acc"],
+                    "delta_acc_vs_pseudo": None
+                    if base_metric["acc"] is None or robust_metric["acc"] is None
+                    else float(robust_metric["acc"] - base_metric["acc"]),
+                    "base_weighted_f1_vs_pseudo": base_metric["weighted_f1"],
+                    "robust_weighted_f1_vs_pseudo": robust_metric["weighted_f1"],
+                    "delta_weighted_f1_vs_pseudo": None
+                    if base_metric["weighted_f1"] is None or robust_metric["weighted_f1"] is None
+                    else float(robust_metric["weighted_f1"] - base_metric["weighted_f1"]),
+                }
+            )
+
+        for c in range(num_classes):
+            cls_mask = mask & (pseudo_labels == c)
+            cls_n = int(np.sum(cls_mask))
+            if cls_n == 0:
+                continue
+            row = {
+                "group": group_name,
+                "source_views": source_views,
+                "heldout_view": heldout_view,
+                "class_idx": int(c),
+                "class": idx2label[c],
+                "pseudo_support": cls_n,
+                "pseudo_support_frac_in_group": float(cls_n / max(1, selected)),
+                "pseudo_acc_if_labeled": None if y_true is None else float(np.mean(y_true[cls_mask] == c)),
+            }
+            for v in views:
+                base_recall = float(np.mean(base_preds[v][cls_mask] == c))
+                robust_recall = float(np.mean(robust_preds[v][cls_mask] == c))
+                row[f"{v}_base_recall_vs_pseudo"] = base_recall
+                row[f"{v}_robust_recall_vs_pseudo"] = robust_recall
+                row[f"{v}_delta_recall_vs_pseudo"] = robust_recall - base_recall
+            class_rows.append(row)
+
+    summary_path = os.path.join(output_dir, "cct_pseudo_agreement_summary.json")
+    view_metrics_path = os.path.join(output_dir, "cct_pseudo_agreement_view_metrics.csv")
+    class_summary_path = os.path.join(output_dir, "cct_pseudo_agreement_class_summary.csv")
+    sample_path = os.path.join(output_dir, "cct_pseudo_agreement_samples.csv.gz")
+    pd.DataFrame(view_rows).to_csv(view_metrics_path, index=False)
+    pd.DataFrame(class_rows).to_csv(class_summary_path, index=False)
+    if sample_frames:
+        pd.concat(sample_frames, ignore_index=True).to_csv(sample_path, index=False, compression="gzip")
+    else:
+        sample_path = None
+    summary_payload = {
+        "views": views,
+        "num_samples": int(n),
+        "target_has_label": bool(y_true is not None),
+        "groups": summary_rows,
+        "view_metrics_path": view_metrics_path,
+        "class_summary_path": class_summary_path,
+        "sample_path": sample_path,
+    }
+    with open(summary_path, "w") as f:
+        json.dump(summary_payload, f, indent=2, sort_keys=True)
+    summary_payload["summary_path"] = summary_path
+    return summary_payload
 
 
 def train_cct_head(
@@ -1054,6 +1372,8 @@ def main():
         "save_feature_cache_dir": args.save_feature_cache_dir,
         "output_dir": args.output_dir,
     }
+    pseudo_audit_cache = {}
+    pseudo_audit_target_labels = None
 
     for view in views:
         model_ts = model_ts_by_view[view]
@@ -1171,6 +1491,9 @@ def main():
         K = int(round(float(args.cct_target_cluster_ratio) * float(num_classes)))
         K = max(1, min(K, int(target_np.shape[0])))
         target_centers, target_ids, target_masses = kmeans_target(target_np, K, metric=args.cct_distance)
+        target_cluster_intra = target_cluster_intra_distances(
+            target_np, target_ids, target_centers, metric=args.cct_distance
+        )
 
         # Step 4/5: alignment and delta
         A, ent, mu_target = compute_alignment(
@@ -1181,6 +1504,17 @@ def main():
             tau=args.cct_assignment_tau,
         )
         delta = (mu_target - source_mu).astype(np.float32)  # [C,D]
+        class_entropy_all, class_entropy_norm_all, class_soft_mass_all, class_orphan_all = class_assignment_entropy(
+            A, ent, target_masses
+        )
+        max_intra = float(np.max(target_cluster_intra)) if target_cluster_intra.size else 0.0
+        class_intra_distance, _, _ = class_weighted_cluster_stat(
+            A, target_masses, target_cluster_intra, orphan_value=max_intra
+        )
+        class_intra_distance_norm = normalize_positive(class_intra_distance, orphan=class_orphan_all)
+        class_reliability = class_shift_reliability(
+            class_entropy_norm_all, class_intra_distance_norm, orphan=class_orphan_all
+        )
 
         delta_norms = np.linalg.norm(delta, axis=1)
         assignment_entropy_stats = {
@@ -1192,6 +1526,17 @@ def main():
             "delta_norm_min": float(np.min(delta_norms)) if delta_norms.size else 0.0,
             "delta_norm_mean": float(np.mean(delta_norms)) if delta_norms.size else 0.0,
             "delta_norm_max": float(np.max(delta_norms)) if delta_norms.size else 0.0,
+        }
+        intra_distance_stats = {
+            "target_cluster_intra_distance_min": float(np.min(target_cluster_intra)) if target_cluster_intra.size else 0.0,
+            "target_cluster_intra_distance_mean": float(np.mean(target_cluster_intra)) if target_cluster_intra.size else 0.0,
+            "target_cluster_intra_distance_max": float(np.max(target_cluster_intra)) if target_cluster_intra.size else 0.0,
+            "class_target_intra_distance_min": float(np.min(class_intra_distance)) if class_intra_distance.size else 0.0,
+            "class_target_intra_distance_mean": float(np.mean(class_intra_distance)) if class_intra_distance.size else 0.0,
+            "class_target_intra_distance_max": float(np.max(class_intra_distance)) if class_intra_distance.size else 0.0,
+            "class_shift_reliability_min": float(np.min(class_reliability)) if class_reliability.size else 0.0,
+            "class_shift_reliability_mean": float(np.mean(class_reliability)) if class_reliability.size else 0.0,
+            "class_shift_reliability_max": float(np.max(class_reliability)) if class_reliability.size else 0.0,
         }
 
         # Step 6: head-only finetune
@@ -1213,6 +1558,7 @@ def main():
         target_eval_metric_analysis = None
         best_target_wf1 = {"step": None, "weighted_f1": None, "rows": None, "pearson": None, "spearman": None}
         best_target_wf1_analysis = None
+        best_target_wf1_reliability_analysis = None
         eval_base_preds = None
         eval_base_f1 = None
         eval_support = None
@@ -1220,6 +1566,9 @@ def main():
         eval_class_entropy_norm = None
         eval_class_mass = None
         eval_orphan = None
+        eval_class_intra_distance = None
+        eval_class_intra_distance_norm = None
+        eval_class_reliability = None
         eval_base_counts = None
         eval_base_fracs = None
         if args.eval_target_after_train and target_has_label and target_labels is not None:
@@ -1236,6 +1585,9 @@ def main():
             eval_class_entropy, eval_class_entropy_norm, eval_class_mass, eval_orphan = class_assignment_entropy(
                 A, ent, target_masses
             )
+            eval_class_intra_distance = class_intra_distance
+            eval_class_intra_distance_norm = class_intra_distance_norm
+            eval_class_reliability = class_reliability
             eval_base_counts, eval_base_fracs = pred_distribution(eval_base_preds, num_classes)
 
         def record_eval_entropy_delta_f1(step, current_head):
@@ -1306,6 +1658,9 @@ def main():
                     "target_cluster_assignment_entropy_norm": float(eval_class_entropy_norm[cls_idx]),
                     "target_cluster_soft_mass": float(eval_class_mass[cls_idx]),
                     "is_orphan_class": bool(eval_orphan[cls_idx]),
+                    "target_cluster_intra_distance": float(eval_class_intra_distance[cls_idx]),
+                    "target_cluster_intra_distance_norm": float(eval_class_intra_distance_norm[cls_idx]),
+                    "shift_reliability": float(eval_class_reliability[cls_idx]),
                     "delta_norm": float(delta_norms[cls_idx]),
                     "base_pred_count": int(eval_base_counts[cls_idx]),
                     "current_pred_count": int(current_counts[cls_idx]),
@@ -1368,6 +1723,13 @@ def main():
                 "best_target_wf1",
                 f"{view}: best target WF1 step {best_target_wf1['step']} entropy vs Delta F1",
             )
+            best_target_wf1_reliability_analysis = write_reliability_delta_plots(
+                best_df,
+                args.output_dir,
+                view,
+                "best_target_wf1",
+                f"{view}: best target WF1 step {best_target_wf1['step']} reliability diagnostics vs Delta F1",
+            )
 
         # Target diagnostics: base vs robust (for analysis only; no target labels used in training/selection).
         base_target_metrics = None
@@ -1392,6 +1754,12 @@ def main():
             ent_robust = probs_entropy(robust_probs)
             base_counts, base_fracs = pred_distribution(base_preds, num_classes)
             robust_counts, robust_fracs = pred_distribution(robust_preds, num_classes)
+            pseudo_audit_cache[view] = {
+                "base_preds": base_preds.copy(),
+                "robust_preds": robust_preds.copy(),
+            }
+            if target_has_label and target_labels is not None:
+                pseudo_audit_target_labels = target_labels.detach().cpu().numpy().astype(np.int64)
 
             if target_has_label:
                 base_target_metrics = {k: base_eval.get(k) for k in ["acc", "weighted_f1", "top2", "top3"] if k in base_eval}
@@ -1411,6 +1779,9 @@ def main():
                     base_fracs=base_fracs,
                     robust_counts=robust_counts,
                     robust_fracs=robust_fracs,
+                    class_intra_distance=class_intra_distance,
+                    class_intra_distance_norm=class_intra_distance_norm,
+                    shift_reliability=class_reliability,
                 )
 
             pred_stats = {
@@ -1485,6 +1856,11 @@ def main():
         np.save(view_prefix + "_assignment.npy", A.astype(np.float32))
         np.save(view_prefix + "_target_cluster_centers.npy", target_centers.astype(np.float32))
         np.save(view_prefix + "_target_cluster_masses.npy", target_masses.astype(np.int64))
+        np.save(view_prefix + "_target_cluster_ids.npy", target_ids.astype(np.int64))
+        np.save(view_prefix + "_target_cluster_intra_distance.npy", target_cluster_intra.astype(np.float32))
+        np.save(view_prefix + "_class_target_intra_distance.npy", class_intra_distance.astype(np.float32))
+        np.save(view_prefix + "_class_target_intra_distance_norm.npy", class_intra_distance_norm.astype(np.float32))
+        np.save(view_prefix + "_class_shift_reliability.npy", class_reliability.astype(np.float32))
         np.save(view_prefix + "_source_prototypes.npy", np.asarray(proto_pack, dtype=np.float32))
         np.save(view_prefix + "_source_prototype_class_ids.npy", np.asarray(proto_class_ids, dtype=np.int64))
         np.save(view_prefix + "_source_prototype_masses.npy", np.asarray(proto_masses_pack, dtype=np.int64))
@@ -1505,6 +1881,7 @@ def main():
             "source_proto_count_max": int(source_proto_counts_arr.max()) if source_proto_counts_arr.size else 0,
             **delta_norm_stats,
             **assignment_entropy_stats,
+            **intra_distance_stats,
             "base_val_weighted_f1": float(base_val_weighted_f1),
             "best_step": int(best["step"]),
             "best_val_weighted_f1": float(best["metrics"]["weighted_f1"]) if best["metrics"] else 0.0,
@@ -1529,6 +1906,9 @@ def main():
             "best_target_wf1_entropy_delta_f1_csv_path": None if best_target_wf1_analysis is None else best_target_wf1_analysis.get("csv_path"),
             "best_target_wf1_entropy_delta_f1_json_path": None if best_target_wf1_analysis is None else best_target_wf1_analysis.get("json_path"),
             "best_target_wf1_entropy_delta_f1_plot_path": None if best_target_wf1_analysis is None else best_target_wf1_analysis.get("plot_path"),
+            "best_target_wf1_reliability_delta_f1_csv_path": None if best_target_wf1_reliability_analysis is None else best_target_wf1_reliability_analysis.get("csv_path"),
+            "best_target_wf1_reliability_delta_f1_json_path": None if best_target_wf1_reliability_analysis is None else best_target_wf1_reliability_analysis.get("json_path"),
+            "best_target_wf1_reliability_delta_f1_plot_path": None if best_target_wf1_reliability_analysis is None else best_target_wf1_reliability_analysis.get("plot_path"),
             "target_eval_history_csv_path": target_eval_history_path,
             "target_eval_metric_correlations_json_path": None if target_eval_metric_analysis is None else target_eval_metric_analysis.get("json_path"),
             "target_eval_metric_plot_path": None if target_eval_metric_analysis is None else target_eval_metric_analysis.get("plot_path"),
@@ -1573,6 +1953,15 @@ def main():
             "delta_norm_min": cct_summary_view["delta_norm_min"],
             "delta_norm_mean": cct_summary_view["delta_norm_mean"],
             "delta_norm_max": cct_summary_view["delta_norm_max"],
+            "target_cluster_intra_distance_min": cct_summary_view["target_cluster_intra_distance_min"],
+            "target_cluster_intra_distance_mean": cct_summary_view["target_cluster_intra_distance_mean"],
+            "target_cluster_intra_distance_max": cct_summary_view["target_cluster_intra_distance_max"],
+            "class_target_intra_distance_min": cct_summary_view["class_target_intra_distance_min"],
+            "class_target_intra_distance_mean": cct_summary_view["class_target_intra_distance_mean"],
+            "class_target_intra_distance_max": cct_summary_view["class_target_intra_distance_max"],
+            "class_shift_reliability_min": cct_summary_view["class_shift_reliability_min"],
+            "class_shift_reliability_mean": cct_summary_view["class_shift_reliability_mean"],
+            "class_shift_reliability_max": cct_summary_view["class_shift_reliability_max"],
             "assignment_entropy_min": cct_summary_view["assignment_entropy_min"],
             "assignment_entropy_mean": cct_summary_view["assignment_entropy_mean"],
             "assignment_entropy_max": cct_summary_view["assignment_entropy_max"],
@@ -1592,6 +1981,11 @@ def main():
             "cct_assignment_path": view_prefix + "_assignment.npy",
             "cct_target_cluster_centers_path": view_prefix + "_target_cluster_centers.npy",
             "cct_target_cluster_masses_path": view_prefix + "_target_cluster_masses.npy",
+            "cct_target_cluster_ids_path": view_prefix + "_target_cluster_ids.npy",
+            "cct_target_cluster_intra_distance_path": view_prefix + "_target_cluster_intra_distance.npy",
+            "cct_class_target_intra_distance_path": view_prefix + "_class_target_intra_distance.npy",
+            "cct_class_target_intra_distance_norm_path": view_prefix + "_class_target_intra_distance_norm.npy",
+            "cct_class_shift_reliability_path": view_prefix + "_class_shift_reliability.npy",
             "cct_source_prototypes_path": view_prefix + "_source_prototypes.npy",
             "cct_source_prototype_class_ids_path": view_prefix + "_source_prototype_class_ids.npy",
             "cct_source_prototype_masses_path": view_prefix + "_source_prototype_masses.npy",
@@ -1608,6 +2002,9 @@ def main():
             "best_target_wf1_entropy_delta_f1_csv_path": cct_summary_view["best_target_wf1_entropy_delta_f1_csv_path"],
             "best_target_wf1_entropy_delta_f1_json_path": cct_summary_view["best_target_wf1_entropy_delta_f1_json_path"],
             "best_target_wf1_entropy_delta_f1_plot_path": cct_summary_view["best_target_wf1_entropy_delta_f1_plot_path"],
+            "best_target_wf1_reliability_delta_f1_csv_path": cct_summary_view["best_target_wf1_reliability_delta_f1_csv_path"],
+            "best_target_wf1_reliability_delta_f1_json_path": cct_summary_view["best_target_wf1_reliability_delta_f1_json_path"],
+            "best_target_wf1_reliability_delta_f1_plot_path": cct_summary_view["best_target_wf1_reliability_delta_f1_plot_path"],
             "target_eval_history_csv_path": cct_summary_view["target_eval_history_csv_path"],
             "target_eval_metric_correlations_json_path": cct_summary_view["target_eval_metric_correlations_json_path"],
             "target_eval_metric_plot_path": cct_summary_view["target_eval_metric_plot_path"],
@@ -1636,6 +2033,7 @@ def main():
             "source_proto_count_max": cct_summary_view["source_proto_count_max"],
             **delta_norm_stats,
             **assignment_entropy_stats,
+            **intra_distance_stats,
             "pearson_entropy_delta_f1": cct_summary_view["pearson_entropy_delta_f1"],
             "spearman_entropy_delta_f1": cct_summary_view["spearman_entropy_delta_f1"],
             "entropy_delta_f1_csv_path": cct_summary_view["entropy_delta_f1_csv_path"],
@@ -1646,11 +2044,18 @@ def main():
             "best_target_wf1": cct_summary_view["best_target_wf1"],
             "best_target_wf1_entropy_delta_f1_csv_path": cct_summary_view["best_target_wf1_entropy_delta_f1_csv_path"],
             "best_target_wf1_entropy_delta_f1_plot_path": cct_summary_view["best_target_wf1_entropy_delta_f1_plot_path"],
+            "best_target_wf1_reliability_delta_f1_csv_path": cct_summary_view["best_target_wf1_reliability_delta_f1_csv_path"],
+            "best_target_wf1_reliability_delta_f1_plot_path": cct_summary_view["best_target_wf1_reliability_delta_f1_plot_path"],
             "target_eval_history_csv_path": cct_summary_view["target_eval_history_csv_path"],
             "target_eval_metric_plot_path": cct_summary_view["target_eval_metric_plot_path"],
             "pearson_im_score_target_wf1": cct_summary_view["pearson_im_score_target_wf1"],
             "spearman_im_score_target_wf1": cct_summary_view["spearman_im_score_target_wf1"],
         }
+
+    pseudo_agreement_audit = write_pseudo_agreement_audit(
+        args.output_dir, idx2label, pseudo_audit_cache, target_labels=pseudo_audit_target_labels
+    )
+    summary["pseudo_agreement_audit"] = pseudo_agreement_audit
 
     out_path = os.path.join("model-classifier", f"cct_robust_classifier_summary_{datetime.now().strftime('%Y%m%d%H%M%S')}.json")
     with open(out_path, "w") as f:
