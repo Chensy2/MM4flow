@@ -1102,6 +1102,197 @@ def build_candidate_evidence_summary(candidate_df):
     return rows
 
 
+def rank_score_zero_one(values, higher_better=True):
+    values = np.asarray(values, dtype=np.float64)
+    n = len(values)
+    if n == 0:
+        return np.asarray([], dtype=np.float64)
+    if n == 1:
+        return np.ones(1, dtype=np.float64)
+    ranks = average_ranks(values, higher_better=higher_better)
+    return (n - ranks) / max(float(n - 1), 1.0)
+
+
+def rank_numbers(values, higher_better=True):
+    values = np.asarray(values, dtype=np.float64)
+    ranks = average_ranks(values, higher_better=higher_better)
+    return [int(rank) if abs(rank - round(rank)) < 1e-12 else float(rank) for rank in ranks]
+
+
+def build_view_reliability_diagnostics(
+    views, source_val_outputs, target_outputs, y_source_val, source_val_mask,
+    y_target, target_known_mask, num_classes, source_prior
+):
+    base_rows = []
+    for view in views:
+        source_probs = source_val_outputs[view]['probs']
+        target_probs = target_outputs[view]['probs']
+        source_pred = source_val_outputs[view]['pred']
+        target_pred = target_outputs[view]['pred']
+
+        source_pred_freq = pred_frequency(source_pred, num_classes)
+        source_prob_mean = np.mean(source_probs, axis=0)
+        source_metrics = distribution_metrics(source_probs, source_pred, num_classes, source_prior)
+        target_metrics = distribution_metrics(
+            target_probs, target_pred, num_classes, source_prior,
+            source_pred_freq=source_pred_freq, source_prob_mean=source_prob_mean
+        )
+        target_mean_prob = np.mean(target_probs, axis=0)
+        target_im_score = entropy_dist(target_mean_prob) - mean_entropy(target_probs)
+        entropy_shift = target_metrics['mean_entropy'] - source_metrics['mean_entropy']
+
+        base_rows.append({
+            'view': view,
+            'target_acc_diagnostic': safe_accuracy(y_target, target_pred, target_known_mask),
+            'target_weighted_f1_diagnostic': weighted_f1_or_none(y_target, target_pred, target_known_mask),
+            'source_acc': safe_accuracy(y_source_val, source_pred, source_val_mask),
+            'source_weighted_f1': weighted_f1_or_none(y_source_val, source_pred, source_val_mask),
+            'source_mean_margin': source_metrics['mean_margin'],
+            'source_mean_confidence': source_metrics['mean_confidence'],
+            'source_mean_entropy': source_metrics['mean_entropy'],
+            'delta_prior_penalty': target_metrics['prior_penalty'] - source_metrics['prior_penalty'],
+            'source_target_pred_freq_js': target_metrics['pred_freq_js_to_source'],
+            'source_target_mean_prob_js': target_metrics['mean_prob_js_to_source'],
+            'delta_collapse_penalty': target_metrics['collapse_penalty'] - source_metrics['collapse_penalty'],
+            'delta_prediction_diversity_risk': (
+                target_metrics['prediction_diversity_risk'] - source_metrics['prediction_diversity_risk']
+            ),
+            'source_target_conf_shift': target_metrics['mean_confidence'] - source_metrics['mean_confidence'],
+            'source_target_margin_shift': target_metrics['mean_margin'] - source_metrics['mean_margin'],
+            'entropy_shift': entropy_shift,
+            'target_mean_confidence': target_metrics['mean_confidence'],
+            'target_mean_margin': target_metrics['mean_margin'],
+            'target_mean_entropy': target_metrics['mean_entropy'],
+            'target_prediction_diversity_risk': target_metrics['prediction_diversity_risk'],
+            'target_collapse_penalty': target_metrics['collapse_penalty'],
+            'target_im_score': target_im_score,
+        })
+
+    df = pd.DataFrame(base_rows)
+    if df.empty:
+        return [], []
+
+    groups = {
+        'C_v': [
+            ('source_weighted_f1', True),
+            ('source_acc', True),
+            ('source_mean_margin', True),
+            ('source_mean_confidence', True),
+            ('source_mean_entropy', False),
+        ],
+        'D_v': [
+            ('delta_prior_penalty', False),
+            ('source_target_pred_freq_js', False),
+            ('source_target_mean_prob_js', False),
+            ('delta_collapse_penalty', False),
+            ('delta_prediction_diversity_risk', False),
+            ('source_target_conf_shift', True),
+            ('source_target_margin_shift', True),
+            ('entropy_shift', False),
+        ],
+        'H_v': [
+            ('target_mean_confidence', True),
+            ('target_mean_margin', True),
+            ('target_mean_entropy', False),
+            ('target_prediction_diversity_risk', False),
+            ('target_collapse_penalty', False),
+            ('target_im_score', True),
+        ],
+    }
+    for score_name, specs in groups.items():
+        component_scores = []
+        for metric, higher_better in specs:
+            component = rank_score_zero_one(df[metric].to_numpy(dtype=np.float64), higher_better=higher_better)
+            df[f'{score_name}_{metric}_rank_score'] = component
+            component_scores.append(component)
+        df[score_name] = np.mean(np.stack(component_scores, axis=1), axis=1)
+
+    df['R_v'] = df[['C_v', 'D_v', 'H_v']].mean(axis=1)
+    df['R_degrade_first'] = 0.6 * df['D_v'] + 0.2 * df['C_v'] + 0.2 * df['H_v']
+
+    rank_specs = [
+        ('target_weighted_f1_diagnostic', 'rank_by_target_weighted_f1', True),
+        ('C_v', 'rank_by_C', True),
+        ('D_v', 'rank_by_D', True),
+        ('H_v', 'rank_by_H', True),
+        ('R_v', 'rank_by_R', True),
+        ('R_degrade_first', 'rank_by_R_degrade_first', True),
+    ]
+    for metric, rank_col, higher_better in rank_specs:
+        values = df[metric].fillna(-np.inf if higher_better else np.inf).to_numpy(dtype=np.float64)
+        df[rank_col] = rank_numbers(values, higher_better=higher_better)
+
+    summary_rows = build_view_reliability_score_summary(df)
+    return df.to_dict('records'), summary_rows
+
+
+def build_view_reliability_score_summary(df):
+    if df.empty or 'target_weighted_f1_diagnostic' not in df:
+        return []
+    target = df['target_weighted_f1_diagnostic'].to_numpy(dtype=np.float64)
+    if not np.isfinite(target).any():
+        return []
+
+    best_idx = int(np.nanargmax(target))
+    worst_idx = int(np.nanargmin(target))
+    rows = []
+    for score in ['C_v', 'D_v', 'H_v', 'R_v', 'R_degrade_first']:
+        values = df[score].to_numpy(dtype=np.float64)
+        order = np.argsort(-np.where(np.isfinite(values), values, -np.inf), kind='mergesort')
+        top1 = set(int(i) for i in order[:1])
+        top2 = set(int(i) for i in order[:min(2, len(order))])
+        bottom1 = set(int(i) for i in order[-1:])
+        bottom2 = set(int(i) for i in order[-min(2, len(order)):])
+        rows.append({
+            'score': score,
+            'top1_hits_best_view': bool(best_idx in top1),
+            'top2_contains_best_view': bool(best_idx in top2),
+            'worst_view_bottom1': bool(worst_idx in bottom1),
+            'worst_view_bottom2': bool(worst_idx in bottom2),
+            'spearman_with_target_weighted_f1': spearman_corr(values, target),
+            'best_view': df.iloc[best_idx]['view'],
+            'worst_view': df.iloc[worst_idx]['view'],
+            'top1_view_by_score': df.iloc[int(order[0])]['view'],
+            'top2_views_by_score': '+'.join(df.iloc[list(order[:min(2, len(order))])]['view'].astype(str).tolist()),
+        })
+    return rows
+
+
+def robust_view_first_policy(view_reliability_rows, target_probs_by_view, tau_accept):
+    if not view_reliability_rows:
+        return None
+    rows = sorted(view_reliability_rows, key=lambda row: row['D_v'], reverse=True)
+    top = rows[0]
+    second = rows[1] if len(rows) > 1 else None
+    if second is None or top['D_v'] - second['D_v'] >= tau_accept:
+        probs = target_probs_by_view[top['view']]
+        return {
+            'decision': 'accept_top1_by_D',
+            'selected_views': [top['view']],
+            'weights': {top['view']: 1.0},
+            'probs': probs,
+        }
+
+    selected = rows[:2]
+    d_values = np.array([max(float(row['D_v']), 0.0) for row in selected], dtype=np.float64)
+    if d_values.sum() <= 1e-12:
+        weights = np.ones(len(selected), dtype=np.float64) / len(selected)
+    else:
+        weights = d_values / d_values.sum()
+    probs = np.zeros_like(target_probs_by_view[selected[0]['view']], dtype=np.float64)
+    weight_dict = {}
+    for weight, row in zip(weights, selected):
+        probs += float(weight) * target_probs_by_view[row['view']]
+        weight_dict[row['view']] = float(weight)
+    probs = probs / np.maximum(probs.sum(axis=1, keepdims=True), 1e-12)
+    return {
+        'decision': 'fuse_top2_by_D',
+        'selected_views': [row['view'] for row in selected],
+        'weights': weight_dict,
+        'probs': probs,
+    }
+
+
 def top2_gap(values):
     values = np.asarray(values, dtype=np.float64)
     if len(values) < 2:
@@ -1756,6 +1947,7 @@ def main():
     parser.add_argument('--overwrite_cache', action='store_true')
     parser.add_argument('--agreement_gate_fallback', choices=['prob', 'uniform', 'sharper', 'average'], default='prob')
     parser.add_argument('--agreement_gate_margin', type=float, default=0.1)
+    parser.add_argument('--rvf_tau_accept', type=float, default=0.25)
     parser.add_argument('--audit_only', action='store_true')
     parser.add_argument('--write_health_audit', action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument('--w_audit_geometry_margin', type=float, default=1.0)
@@ -1965,6 +2157,25 @@ def main():
     )
     pred_hspf = hspf['pred']
 
+    view_reliability_rows, view_reliability_summary_rows = build_view_reliability_diagnostics(
+        views,
+        source_val_outputs,
+        target_outputs,
+        y_source_val,
+        source_val_mask,
+        y_target,
+        target_known_mask,
+        num_classes,
+        src_prior,
+    )
+    rvf_policy = robust_view_first_policy(view_reliability_rows, target_probs, args.rvf_tau_accept)
+    if rvf_policy is not None:
+        probs_rvf = rvf_policy['probs']
+        pred_rvf = probs_rvf.argmax(axis=1)
+    else:
+        probs_rvf = None
+        pred_rvf = pred_avg
+
     prob_selected = np.array([views[i] for i in weights_prob.argmax(axis=0)], dtype=object)
     geo_selected = np.array([views[i] for i in weights_geo.argmax(axis=0)], dtype=object)
     agreement_selected = np.array([views[i] for i in weights_agreement.argmax(axis=0)], dtype=object)
@@ -2013,6 +2224,7 @@ def main():
         'cache_dir': args.cache_dir or os.path.join(args.output_dir, 'cache'),
         'agreement_gate_fallback': args.agreement_gate_fallback,
         'agreement_gate_margin': args.agreement_gate_margin,
+        'rvf_tau_accept': args.rvf_tau_accept,
         'num_classes': num_classes,
         'num_source_samples': int(source_len),
         'num_source_val_samples': int(source_val_len),
@@ -2025,11 +2237,17 @@ def main():
         'geometry_class_fusion_acc': safe_accuracy(y_target, pred_geo, target_known_mask),
         'agreement_gated_class_fusion_acc': safe_accuracy(y_target, pred_agreement, target_known_mask),
         'hspf_acc_diagnostic': safe_accuracy(y_target, pred_hspf, target_known_mask),
+        'robust_view_first_acc_diagnostic': safe_accuracy(y_target, pred_rvf, target_known_mask),
         'hspf_top_candidate': hspf['candidate_rows'][0]['candidate'] if hspf['candidate_rows'] else None,
         'hspf_top_posterior': hspf['candidate_rows'][0]['posterior'] if hspf['candidate_rows'] else None,
         'hspf_entropy_norm': hspf['posterior_entropy_norm'],
         'hspf_view_gate': hspf['view_gate'],
         'hspf_rule_prior': hspf['rule_prior'],
+        'robust_view_first_policy': None if rvf_policy is None else {
+            'decision': rvf_policy['decision'],
+            'selected_views': rvf_policy['selected_views'],
+            'weights': rvf_policy['weights'],
+        },
         'class_oracle_acc': safe_accuracy(y_target, y_class_oracle, target_known_mask),
         'sample_oracle_acc': safe_accuracy(y_target, y_sample_oracle, target_known_mask),
         'health_best_view_match_rate_prob': health_best_view_match_rate_prob,
@@ -2058,12 +2276,22 @@ def main():
         summary['primary_portfolio_weighted_f1'] = float(hspf_weighted_f1)
         summary['primary_portfolio_acc_diagnostic'] = summary['hspf_acc_diagnostic']
         summary['primary_portfolio_macro_f1_diagnostic'] = float(hspf_macro_f1)
+        _, _, rvf_weighted_f1, _ = precision_recall_fscore_support(
+            y_target[target_known_mask], pred_rvf[target_known_mask], average='weighted', zero_division=0
+        )
+        _, _, rvf_macro_f1, _ = precision_recall_fscore_support(
+            y_target[target_known_mask], pred_rvf[target_known_mask], average='macro', zero_division=0
+        )
+        summary['robust_view_first_weighted_f1'] = float(rvf_weighted_f1)
+        summary['robust_view_first_macro_f1_diagnostic'] = float(rvf_macro_f1)
     else:
         summary['hspf_weighted_f1'] = None
         summary['hspf_macro_f1_diagnostic'] = None
         summary['primary_portfolio_weighted_f1'] = None
         summary['primary_portfolio_acc_diagnostic'] = None
         summary['primary_portfolio_macro_f1_diagnostic'] = None
+        summary['robust_view_first_weighted_f1'] = None
+        summary['robust_view_first_macro_f1_diagnostic'] = None
 
     target_out = target_view_dfs[views[0]].copy()
     target_out['y_true_idx'] = y_target
@@ -2074,6 +2302,7 @@ def main():
     target_out['pred_geometry_idx'] = pred_geo
     target_out['pred_agreement_gated_idx'] = pred_agreement
     target_out['pred_hspf_idx'] = pred_hspf
+    target_out['pred_robust_view_first_idx'] = pred_rvf
     target_out['pred_class_oracle_idx'] = y_class_oracle
     target_out['pred_sample_oracle_idx'] = y_sample_oracle
     for view in views:
@@ -2083,6 +2312,7 @@ def main():
     target_out['pred_geometry'] = [idx2label[i] for i in pred_geo]
     target_out['pred_agreement_gated'] = [idx2label[i] for i in pred_agreement]
     target_out['pred_hspf'] = [idx2label[i] for i in pred_hspf]
+    target_out['pred_robust_view_first'] = [idx2label[i] for i in pred_rvf]
     target_out['pred_class_oracle'] = [idx2label[i] for i in y_class_oracle]
     target_out['pred_sample_oracle'] = [idx2label[i] for i in y_sample_oracle]
     for view in views:
@@ -2096,6 +2326,7 @@ def main():
         'geometry_class_fusion': pred_geo,
         'agreement_gated_class_fusion': pred_agreement,
         'hspf': pred_hspf,
+        'robust_view_first': pred_rvf,
         'class_oracle': y_class_oracle,
         'sample_oracle': y_sample_oracle,
     })
@@ -2132,6 +2363,12 @@ def main():
     pd.DataFrame(hspf['candidate_rows']).to_csv(os.path.join(args.output_dir, 'hspf_candidate_ranking.csv'), index=False)
     pd.DataFrame(view_shift_evidence_diagnostics).to_csv(
         os.path.join(args.output_dir, 'view_shift_evidence_diagnostics.csv'), index=False
+    )
+    pd.DataFrame(view_reliability_rows).to_csv(
+        os.path.join(args.output_dir, 'view_reliability_diagnostics.csv'), index=False
+    )
+    pd.DataFrame(view_reliability_summary_rows).to_csv(
+        os.path.join(args.output_dir, 'view_reliability_score_summary.csv'), index=False
     )
     hspf_candidate_evidence_df.to_csv(
         os.path.join(args.output_dir, 'hspf_candidate_evidence_values.csv'), index=False
