@@ -350,6 +350,9 @@ def aggregate_results(all_results, output_csv):
     all_results.to_csv(output_csv.replace('.csv', '_all_results.csv'), index=False)
     build_dataset_diagnostics(all_results).to_csv(output_csv.replace('.csv', '_dataset_diagnostics.csv'), index=False)
     build_compact_dataset_table(all_results).to_csv(output_csv.replace('.csv', '_compact_per_dataset.csv'), index=False)
+    build_fixed_config_dataset_table(all_results).to_csv(
+        output_csv.replace('.csv', '_fixed_config_per_dataset.csv'), index=False
+    )
 
 
 def best_row(df, method):
@@ -427,6 +430,82 @@ def build_compact_dataset_table(all_results):
         'Uniform lambda': '',
         'D-res lambda': '',
         'D-res tau': '',
+    }
+    return pd.concat([out, pd.DataFrame([mean_row])], ignore_index=True)
+
+
+def fixed_row(df, method, lam=None, tau=None):
+    subset = df[df['method'] == method]
+    if lam is not None:
+        subset = subset[np.isclose(subset['lambda'].astype(float), float(lam), equal_nan=False)]
+    if tau is not None:
+        subset = subset[np.isclose(subset['tau'].astype(float), float(tau), equal_nan=False)]
+    if subset.empty:
+        return None
+    return subset.iloc[0]
+
+
+def build_fixed_config_dataset_table(all_results):
+    rows = []
+    for dataset, df in all_results.groupby('dataset'):
+        avg = fixed_row(df, 'average_softmax_all_views')
+        anchor = fixed_row(df, 'D_anchor_only')
+        uniform = fixed_row(df, 'anchor_uniform_residual', lam=0.5)
+        d_res = fixed_row(df, 'anchor_D_weighted_residual', lam=0.5, tau=1.0)
+        if avg is None or anchor is None or uniform is None or d_res is None:
+            continue
+
+        avg_f1 = float(avg['weighted_f1'])
+        anchor_f1 = float(anchor['weighted_f1'])
+        uniform_f1 = float(uniform['weighted_f1'])
+        d_res_f1 = float(d_res['weighted_f1'])
+        rows.append({
+            'Dataset': dataset,
+            'Avg softmax': compact_number(avg_f1),
+            'D anchor-only': compact_number(anchor_f1),
+            'Anchor + Uniform residual (lambda=0.5)': compact_number(uniform_f1),
+            'Uniform vs Avg': compact_number(uniform_f1 - avg_f1, signed=True),
+            'Uniform vs Anchor': compact_number(uniform_f1 - anchor_f1, signed=True),
+            'Anchor + D-weighted residual (lambda=0.5,tau=1.0)': compact_number(d_res_f1),
+            'D-res vs Avg': compact_number(d_res_f1 - avg_f1, signed=True),
+            'D-res vs Anchor': compact_number(d_res_f1 - anchor_f1, signed=True),
+            'Anchor view': anchor['anchor_view'],
+            'Anchor is best': bool(anchor['anchor_is_best']),
+        })
+
+    if not rows:
+        return pd.DataFrame()
+
+    out = pd.DataFrame(rows)
+    numeric_cols = [
+        'Avg softmax',
+        'D anchor-only',
+        'Anchor + Uniform residual (lambda=0.5)',
+        'Anchor + D-weighted residual (lambda=0.5,tau=1.0)',
+    ]
+    means = {col: float(out[col].astype(float).mean()) for col in numeric_cols}
+    mean_row = {
+        'Dataset': 'Mean',
+        'Avg softmax': compact_number(means['Avg softmax']),
+        'D anchor-only': compact_number(means['D anchor-only']),
+        'Anchor + Uniform residual (lambda=0.5)': compact_number(means['Anchor + Uniform residual (lambda=0.5)']),
+        'Uniform vs Avg': compact_number(
+            means['Anchor + Uniform residual (lambda=0.5)'] - means['Avg softmax'], signed=True
+        ),
+        'Uniform vs Anchor': compact_number(
+            means['Anchor + Uniform residual (lambda=0.5)'] - means['D anchor-only'], signed=True
+        ),
+        'Anchor + D-weighted residual (lambda=0.5,tau=1.0)': compact_number(
+            means['Anchor + D-weighted residual (lambda=0.5,tau=1.0)']
+        ),
+        'D-res vs Avg': compact_number(
+            means['Anchor + D-weighted residual (lambda=0.5,tau=1.0)'] - means['Avg softmax'], signed=True
+        ),
+        'D-res vs Anchor': compact_number(
+            means['Anchor + D-weighted residual (lambda=0.5,tau=1.0)'] - means['D anchor-only'], signed=True
+        ),
+        'Anchor view': '',
+        'Anchor is best': '',
     }
     return pd.concat([out, pd.DataFrame([mean_row])], ignore_index=True)
 
