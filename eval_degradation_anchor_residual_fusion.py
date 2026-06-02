@@ -349,6 +349,86 @@ def aggregate_results(all_results, output_csv):
     aggregate.to_csv(output_csv, index=False)
     all_results.to_csv(output_csv.replace('.csv', '_all_results.csv'), index=False)
     build_dataset_diagnostics(all_results).to_csv(output_csv.replace('.csv', '_dataset_diagnostics.csv'), index=False)
+    build_compact_dataset_table(all_results).to_csv(output_csv.replace('.csv', '_compact_per_dataset.csv'), index=False)
+
+
+def best_row(df, method):
+    subset = df[df['method'] == method]
+    if subset.empty:
+        return None
+    return subset.sort_values('weighted_f1', ascending=False).iloc[0]
+
+
+def compact_number(value, signed=False):
+    if value is None or pd.isna(value):
+        return ''
+    if signed:
+        return f'{float(value):+.4f}'
+    return f'{float(value):.4f}'
+
+
+def build_compact_dataset_table(all_results):
+    rows = []
+    for dataset, df in all_results.groupby('dataset'):
+        avg = best_row(df, 'average_softmax_all_views')
+        anchor = best_row(df, 'D_anchor_only')
+        uniform = best_row(df, 'anchor_uniform_residual')
+        d_res = best_row(df, 'anchor_D_weighted_residual')
+        if avg is None or anchor is None or uniform is None or d_res is None:
+            continue
+
+        avg_f1 = float(avg['weighted_f1'])
+        anchor_f1 = float(anchor['weighted_f1'])
+        uniform_f1 = float(uniform['weighted_f1'])
+        d_res_f1 = float(d_res['weighted_f1'])
+        rows.append({
+            'Dataset': dataset,
+            'Avg softmax': compact_number(avg_f1),
+            'D anchor-only': compact_number(anchor_f1),
+            'Anchor + Uniform residual': compact_number(uniform_f1),
+            'Uniform vs Avg': compact_number(uniform_f1 - avg_f1, signed=True),
+            'Uniform vs Anchor': compact_number(uniform_f1 - anchor_f1, signed=True),
+            'Anchor + D-weighted residual': compact_number(d_res_f1),
+            'D-res vs Avg': compact_number(d_res_f1 - avg_f1, signed=True),
+            'D-res vs Anchor': compact_number(d_res_f1 - anchor_f1, signed=True),
+            'Anchor view': anchor['anchor_view'],
+            'Anchor is best': bool(anchor['anchor_is_best']),
+            'Uniform lambda': uniform['lambda'],
+            'D-res lambda': d_res['lambda'],
+            'D-res tau': d_res['tau'],
+        })
+
+    if not rows:
+        return pd.DataFrame()
+
+    out = pd.DataFrame(rows)
+    numeric = {
+        'Avg softmax': out['Avg softmax'].astype(float),
+        'D anchor-only': out['D anchor-only'].astype(float),
+        'Anchor + Uniform residual': out['Anchor + Uniform residual'].astype(float),
+        'Anchor + D-weighted residual': out['Anchor + D-weighted residual'].astype(float),
+    }
+    mean_avg = float(numeric['Avg softmax'].mean())
+    mean_anchor = float(numeric['D anchor-only'].mean())
+    mean_uniform = float(numeric['Anchor + Uniform residual'].mean())
+    mean_d_res = float(numeric['Anchor + D-weighted residual'].mean())
+    mean_row = {
+        'Dataset': 'Mean',
+        'Avg softmax': compact_number(mean_avg),
+        'D anchor-only': compact_number(mean_anchor),
+        'Anchor + Uniform residual': compact_number(mean_uniform),
+        'Uniform vs Avg': compact_number(mean_uniform - mean_avg, signed=True),
+        'Uniform vs Anchor': compact_number(mean_uniform - mean_anchor, signed=True),
+        'Anchor + D-weighted residual': compact_number(mean_d_res),
+        'D-res vs Avg': compact_number(mean_d_res - mean_avg, signed=True),
+        'D-res vs Anchor': compact_number(mean_d_res - mean_anchor, signed=True),
+        'Anchor view': '',
+        'Anchor is best': '',
+        'Uniform lambda': '',
+        'D-res lambda': '',
+        'D-res tau': '',
+    }
+    return pd.concat([out, pd.DataFrame([mean_row])], ignore_index=True)
 
 
 def main():
