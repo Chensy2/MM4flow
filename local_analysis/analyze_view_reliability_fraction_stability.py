@@ -185,17 +185,26 @@ def infer_source_labels(source_dataset, split_name, label2idx, expected_len):
     if not os.path.exists(path):
         raise FileNotFoundError(path)
     df = pd.read_csv(path, compression='gzip', index_col=0)
-    if 'up' in df.columns and 'down' in df.columns:
-        df = df[df['up'] + df['down'] >= MIN_PKTS].copy()
     if 'label' not in df.columns:
         raise ValueError(f'Missing label column in {path}')
-    labels = df['label'].map(label2idx).fillna(-1).astype(int).to_numpy()
-    if len(labels) != expected_len:
-        raise ValueError(
-            f'Source label/cache length mismatch for {path}: labels={len(labels)}, cache={expected_len}. '
-            f'Check source split and preprocessing.'
-        )
-    return labels
+    raw_labels = df['label'].map(label2idx).fillna(-1).astype(int).to_numpy()
+    if len(raw_labels) == expected_len:
+        return raw_labels
+
+    if 'up' in df.columns and 'down' in df.columns:
+        filtered = df[df['up'] + df['down'] >= MIN_PKTS].copy()
+        filtered_labels = filtered['label'].map(label2idx).fillna(-1).astype(int).to_numpy()
+        if len(filtered_labels) == expected_len:
+            return filtered_labels
+        filtered_len = len(filtered_labels)
+    else:
+        filtered_len = None
+
+    raise ValueError(
+        f'Source label/cache length mismatch for {path}: '
+        f'raw_labels={len(raw_labels)}, filtered_labels={filtered_len}, cache={expected_len}. '
+        f'The cache may come from a different source split or preprocessing version.'
+    )
 
 
 def load_cache_npz(output_dir, cache_dir, split, view):
